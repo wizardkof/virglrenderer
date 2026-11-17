@@ -43,6 +43,9 @@
 #include "vkr_allocator.h"
 #include "drm_renderer.h"
 #include "proxy/proxy_renderer.h"
+#ifdef ENABLE_RENDER_SERVER
+#include "server/render_protocol.h"
+#endif
 #include "vrend/vrend_renderer.h"
 #include "vrend/vrend_winsys.h"
 
@@ -59,7 +62,23 @@
 #include "virgl_util.h"
 
 struct global_state {
+   uint64_t instance_serial;
    bool client_initialized;
+   bool teardown_quarantined;
+   bool producer_quiesce_attempted;
+   uint64_t producer_quiesce_generation;
+   int producer_quiesce_result;
+   bool consumer_quiesce_attempted;
+   uint64_t consumer_quiesce_generation;
+   int consumer_quiesce_result;
+   bool reset_release_busy;
+   bool remote_reap_attempted;
+   struct virgl_renderer_reset_reap_result remote_reap_result;
+   bool server_retirement_attempted;
+   struct virgl_renderer_reset_server_result server_retirement_result;
+   bool observer_quiesce_attempted;
+   uint64_t observer_quiesce_generation;
+   int observer_quiesce_result;
    void *cookie;
    int flags;
    const struct virgl_renderer_callbacks *cbs;
@@ -75,6 +94,8 @@ struct global_state {
 };
 
 static struct global_state state;
+/* Exclusive renderer owner serializes this counter across cleaned instances. */
+static uint64_t renderer_instance_serial_counter;
 
 /* new API - just wrap internal API for now */
 
@@ -82,6 +103,9 @@ static int virgl_renderer_resource_create_internal(struct virgl_renderer_resourc
                                                    UNUSED struct iovec *iov, UNUSED uint32_t num_iovs,
                                                    void *image)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    struct virgl_resource *res;
    struct pipe_resource *pipe_res;
    struct vrend_renderer_resource_create_args vrend_args =  { 0 };
@@ -137,6 +161,11 @@ int virgl_renderer_resource_import_eglimage(struct virgl_renderer_resource_creat
 
 void virgl_renderer_resource_set_priv(uint32_t res_handle, void *priv)
 {
+   if (state.teardown_quarantined) {
+      virgl_error("virgl_renderer_resource_set_priv: refused during teardown quarantine\n");
+      return;
+   }
+
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
    if (!res)
       return;
@@ -146,6 +175,10 @@ void virgl_renderer_resource_set_priv(uint32_t res_handle, void *priv)
 
 void *virgl_renderer_resource_get_priv(uint32_t res_handle)
 {
+   if (state.teardown_quarantined) {
+      return NULL;
+   }
+
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
    if (!res)
       return NULL;
@@ -162,6 +195,11 @@ static bool detach_resource(struct virgl_context *ctx, void *data)
 
 void virgl_renderer_resource_unref(uint32_t res_handle)
 {
+   if (state.teardown_quarantined) {
+      virgl_error("virgl_renderer_resource_unref: refused during teardown quarantine\n");
+      return;
+   }
+
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
    struct virgl_context_foreach_args args;
 
@@ -224,6 +262,9 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
                                              uint32_t nlen,
                                              const char *name)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    uint32_t capset_id = ctx_flags & VIRGL_RENDERER_CONTEXT_FLAG_CAPSET_ID_MASK;
    struct virgl_context *ctx;
    int ret;
@@ -299,6 +340,10 @@ int virgl_renderer_submit_cmd(void *buffer,
                               int ctx_id,
                               int ndw)
 {
+   if (state.teardown_quarantined) {
+      return -EBUSY;
+   }
+
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
    if (!ctx)
@@ -323,6 +368,9 @@ int virgl_renderer_transfer_write_iov(uint32_t handle,
                                       struct iovec *iovec,
                                       unsigned int iovec_cnt)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    TRACE_FUNC();
 
    struct virgl_resource *res = virgl_resource_lookup(handle);
@@ -363,6 +411,9 @@ int virgl_renderer_transfer_read_iov(uint32_t handle, uint32_t ctx_id,
                                      uint64_t offset, struct iovec *iovec,
                                      int iovec_cnt)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    TRACE_FUNC();
    struct virgl_resource *res = virgl_resource_lookup(handle);
    struct vrend_transfer_info transfer_info;
@@ -398,6 +449,9 @@ int virgl_renderer_transfer_read_iov(uint32_t handle, uint32_t ctx_id,
 int virgl_renderer_resource_attach_iov(int res_handle, struct iovec *iov,
                                        int num_iovs)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    TRACE_FUNC();
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
    if (!res)
@@ -408,6 +462,11 @@ int virgl_renderer_resource_attach_iov(int res_handle, struct iovec *iov,
 
 void virgl_renderer_resource_detach_iov(int res_handle, struct iovec **iov_p, int *num_iovs_p)
 {
+   if (state.teardown_quarantined) {
+      virgl_error("virgl_renderer_resource_detach_iov: refused during teardown quarantine\n");
+      return;
+   }
+
    TRACE_FUNC();
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
    if (!res)
@@ -423,6 +482,10 @@ void virgl_renderer_resource_detach_iov(int res_handle, struct iovec **iov_p, in
 
 int virgl_renderer_create_fence(int client_fence_id, UNUSED uint32_t ctx_id)
 {
+   if (state.teardown_quarantined) {
+      return -EBUSY;
+   }
+
    TRACE_FUNC();
    const uint32_t fence_id = (uint32_t)client_fence_id;
    if (state.vrend_initialized)
@@ -435,6 +498,10 @@ int virgl_renderer_context_create_fence(uint32_t ctx_id,
                                         uint32_t ring_idx,
                                         uint64_t fence_id)
 {
+   if (state.teardown_quarantined) {
+      return -EBUSY;
+   }
+
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
    if (!ctx)
@@ -446,6 +513,11 @@ int virgl_renderer_context_create_fence(uint32_t ctx_id,
 
 void virgl_renderer_context_poll(uint32_t ctx_id)
 {
+   if (state.teardown_quarantined) {
+      virgl_error("virgl_renderer_context_poll: refused during teardown quarantine\n");
+      return;
+   }
+
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
    if (!ctx)
@@ -471,6 +543,11 @@ void virgl_renderer_force_ctx_0(void)
 
 void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
 {
+   if (state.teardown_quarantined) {
+      virgl_error("virgl_renderer_ctx_attach_resource: refused during teardown quarantine\n");
+      return;
+   }
+
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
@@ -481,6 +558,11 @@ void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
 
 void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
 {
+   if (state.teardown_quarantined) {
+      virgl_error("virgl_renderer_ctx_detach_resource: refused during teardown quarantine\n");
+      return;
+   }
+
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
@@ -751,6 +833,11 @@ virgl_context_foreach_retire_fences(struct virgl_context *ctx,
 
 void virgl_renderer_poll(void)
 {
+   if (state.teardown_quarantined) {
+      virgl_error("virgl_renderer_poll: refused during teardown quarantine\n");
+      return;
+   }
+
    TRACE_FUNC();
    if (state.vrend_initialized)
       vrend_renderer_poll();
@@ -763,6 +850,16 @@ void virgl_renderer_poll(void)
 void virgl_renderer_cleanup(UNUSED void *cookie)
 {
    TRACE_FUNC();
+   if ((state.observer_quiesce_attempted && state.observer_quiesce_result) ||
+       (state.server_retirement_attempted &&
+        (state.server_retirement_result.status ||
+         !state.observer_quiesce_attempted ||
+         state.observer_quiesce_generation != state.server_retirement_result.generation)) ||
+       proxy_renderer_cleanup_check()) {
+      state.teardown_quarantined = true;
+      virgl_error("cleanup refused: checked parent termination incomplete\n");
+      abort();
+   }
    if (state.vrend_initialized)
       vrend_renderer_prepare_reset();
 
@@ -793,10 +890,42 @@ void virgl_renderer_cleanup(UNUSED void *cookie)
    memset(&state, 0, sizeof(state));
 }
 
+static int
+virgl_renderer_assign_instance_serial(void)
+{
+   if (state.instance_serial)
+      return 0;
+   if (!state.client_initialized || !state.resource_initialized ||
+       !state.context_initialized || !state.fence_initialized)
+      return -EBUSY;
+   if (renderer_instance_serial_counter == UINT64_MAX)
+      return -EOVERFLOW;
+   state.instance_serial = ++renderer_instance_serial_counter;
+   return 0;
+}
+
+uint64_t
+virgl_renderer_get_instance_serial(void *cookie)
+{
+   if (!cookie || cookie != state.cookie || !state.client_initialized ||
+       !state.resource_initialized || !state.context_initialized ||
+       !state.fence_initialized)
+      return 0;
+   return state.instance_serial;
+}
+
 int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks *cbs)
 {
    TRACE_INIT();
    TRACE_FUNC();
+
+   if (state.teardown_quarantined) {
+      virgl_error("renderer teardown is quarantined; retain callback lifetime\n");
+      return -EBUSY;
+   }
+
+   if (!state.client_initialized && renderer_instance_serial_counter == UINT64_MAX)
+      return -EOVERFLOW;
 
    int ret;
 
@@ -959,6 +1088,9 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
       state.fence_initialized = true;
    }
 
+   ret = virgl_renderer_assign_instance_serial();
+   if (ret)
+      goto fail;
    return 0;
 
 fail:
@@ -1002,6 +1134,160 @@ void virgl_renderer_reset(void)
 
    if (state.drm_initialized)
       drm_renderer_reset();
+}
+
+bool
+virgl_renderer_is_quarantined(void)
+{
+   return state.teardown_quarantined;
+}
+
+int
+virgl_renderer_quiesce_producers_checked(uint64_t generation, int timeout_ms)
+{
+   if (!generation || timeout_ms <= 0 || !state.context_initialized)
+      return -EINVAL;
+   if (state.producer_quiesce_attempted) {
+      if (state.producer_quiesce_generation != generation)
+         return -ESTALE;
+      return state.producer_quiesce_result;
+   }
+   if (state.teardown_quarantined)
+      return -EBUSY;
+   state.teardown_quarantined = true;
+   state.producer_quiesce_attempted = true;
+   state.producer_quiesce_generation = generation;
+   state.producer_quiesce_result = -EINPROGRESS;
+   /* One context-aggregation deadline includes bounded local observer
+    * preparation and all subsequent producer operations. No unbounded
+    * preparation callback may be substituted by this operation.
+    */
+   state.producer_quiesce_result = virgl_context_quiesce_all(generation, timeout_ms);
+   /* Even success does not clear quarantine: scanout consumers and reset
+    * readiness are deliberately outside this producer-only witness.
+    */
+   return state.producer_quiesce_result;
+}
+
+int
+virgl_renderer_quiesce_consumers_checked(uint64_t generation, int timeout_ms,
+                                         int (*callback)(void *, int), void *data)
+{
+   if (!generation || timeout_ms <= 0 || !callback)
+      return -EINVAL;
+   if (!state.context_initialized || !state.teardown_quarantined ||
+       !state.producer_quiesce_attempted)
+      return -EBUSY;
+   if (state.producer_quiesce_generation != generation)
+      return -ESTALE;
+   if (state.producer_quiesce_result)
+      return -EBUSY;
+   if (state.consumer_quiesce_attempted) {
+      if (state.consumer_quiesce_generation != generation)
+         return -ESTALE;
+      return state.consumer_quiesce_result;
+   }
+   /* Persist pending before invoking the caller: callback reentry must not
+    * start a second attempt or use a previous generation's witness.
+    */
+   state.consumer_quiesce_attempted = true;
+   state.consumer_quiesce_generation = generation;
+   state.consumer_quiesce_result = -EINPROGRESS;
+   struct timespec start, end;
+   if (clock_gettime(CLOCK_MONOTONIC, &start)) {
+      state.consumer_quiesce_result = -EIO;
+      return state.consumer_quiesce_result;
+   }
+   int result = callback(data, timeout_ms);
+   if (result > 0)
+      result = -EPROTO;
+   if (!result) {
+      if (clock_gettime(CLOCK_MONOTONIC, &end)) {
+         result = -EIO;
+      } else {
+         int64_t elapsed = (int64_t)(end.tv_sec - start.tv_sec) * 1000000000 +
+                           end.tv_nsec - start.tv_nsec;
+         if (elapsed < 0 || elapsed > (int64_t)timeout_ms * 1000000)
+            result = -ETIMEDOUT;
+      }
+   }
+   state.consumer_quiesce_result = result;
+   /* Even both phases succeeding leaves ordinary dispatch quarantined.
+    * Resource release needs a separate generation-bound transaction API;
+    * this operation does not destroy state or claim renderer reset-ready.
+    */
+   return result;
+}
+
+int
+virgl_renderer_context_destroy_checked(uint32_t handle)
+{
+   if (state.teardown_quarantined)
+      return -EBUSY;
+   if (!state.context_initialized)
+      return 0;
+   if (!virgl_context_remove_checked(handle)) {
+      state.teardown_quarantined = true;
+      return -EBUSY;
+   }
+   return 0;
+}
+
+int
+virgl_renderer_cleanup_checked(void *cookie)
+{
+   if (state.observer_quiesce_attempted && state.observer_quiesce_result) {
+      state.teardown_quarantined = true;
+      return state.observer_quiesce_result;
+   }
+   int parent_result = state.server_retirement_attempted ?
+      state.server_retirement_result.status : 0;
+   if (!parent_result)
+      parent_result = proxy_renderer_cleanup_check();
+   if (parent_result) {
+      state.teardown_quarantined = true;
+      return parent_result;
+   }
+   if (state.server_retirement_attempted) {
+      if (!state.observer_quiesce_attempted) {
+         state.teardown_quarantined = true;
+         return -EBUSY;
+      }
+      if (state.observer_quiesce_generation != state.server_retirement_result.generation) {
+         state.teardown_quarantined = true;
+         return -ESTALE;
+      }
+   }
+   /* Gate BEFORE vrend prepare, resource destruction or global callback reset.
+    * Preparation may have stopped some contexts before another one failed.
+    */
+   state.teardown_quarantined = true;
+   if (state.remote_reap_attempted) {
+      if (state.remote_reap_result.status)
+         return state.remote_reap_result.status;
+      if (!state.remote_reap_result.remote_reply_valid ||
+          state.remote_reap_result.phase != VIRGL_RENDERER_RESET_RECORDS_REAPED)
+         return -EPROTO;
+   }
+   if (state.context_initialized && !virgl_context_prepare_destroy_all())
+      return -EBUSY;
+   virgl_renderer_cleanup(cookie);
+   return 0;
+}
+
+int
+virgl_renderer_reset_checked(void)
+{
+   if (state.teardown_quarantined)
+      return -EBUSY;
+   state.teardown_quarantined = true;
+   if (state.context_initialized && !virgl_context_prepare_destroy_all())
+      return -EBUSY;
+   virgl_renderer_reset();
+   /* Local reset dispatch is not remote worker/GPU readiness. Never silently
+    * resume ordinary execution by clearing quarantine here.
+    */
+   return 0;
 }
 
 int virgl_renderer_get_poll_fd(void)
@@ -1116,6 +1402,9 @@ static int virgl_renderer_supported_structures(void *execute_args, uint32_t exec
 
 int virgl_renderer_execute(void *execute_args, uint32_t execute_size)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    TRACE_FUNC();
    struct virgl_renderer_hdr *hdr = execute_args;
    if (hdr->stype_version != 0)
@@ -1133,6 +1422,9 @@ int virgl_renderer_execute(void *execute_args, uint32_t execute_size)
 
 int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_create_blob_args *args)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    TRACE_FUNC();
    struct virgl_resource *res;
    struct virgl_context *ctx;
@@ -1227,6 +1519,9 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
 
 int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *out_size)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    TRACE_FUNC();
    int ret = 0;
    void *map = NULL;
@@ -1293,6 +1588,9 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
 
 int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    void *map = NULL;
    struct virgl_context *ctx = NULL;
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
@@ -1345,11 +1643,10 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
    return 0;
 }
 
-int virgl_renderer_resource_unmap(uint32_t res_handle)
+static int
+virgl_renderer_resource_unmap_internal(struct virgl_resource *res)
 {
-   TRACE_FUNC();
    int ret = 0;
-   struct virgl_resource *res = virgl_resource_lookup(res_handle);
    if (!res || !res->mapped)
       return -EINVAL;
 
@@ -1361,22 +1658,361 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
       case VIRGL_RESOURCE_FD_DMABUF:
       case VIRGL_RESOURCE_FD_SHM:
       case VIRGL_RESOURCE_OPAQUE_HANDLE:
-         ret = munmap(res->mapped, res->map_size);
+         if (munmap(res->mapped, res->map_size))
+            ret = -errno;
          break;
       case VIRGL_RESOURCE_FD_OPAQUE:
          ret = vkr_allocator_resource_unmap(res);
          break;
       case VIRGL_RESOURCE_FD_INVALID:
-         /* Avoid a default case so that -Wswitch will tell us at compile time
-          * if a new virgl resource type is added without being handled here.
-          */
          ret = -EINVAL;
          break;
       }
    }
 
-   assert(!ret);
+   /* Failure must not discard the last mapping witness in release builds. */
+   if (ret)
+      return ret;
    res->mapped = NULL;
+   return 0;
+}
+
+int virgl_renderer_resource_unmap(uint32_t res_handle)
+{
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
+   TRACE_FUNC();
+   return virgl_renderer_resource_unmap_internal(virgl_resource_lookup(res_handle));
+}
+
+static int
+virgl_renderer_reset_release_acquire(uint64_t generation)
+{
+   if (!generation)
+      return -EINVAL;
+   if (!state.context_initialized || !state.resource_initialized ||
+       !state.teardown_quarantined || !state.producer_quiesce_attempted ||
+       !state.consumer_quiesce_attempted)
+      return -EBUSY;
+   if (state.producer_quiesce_generation != generation ||
+       state.consumer_quiesce_generation != generation)
+      return -ESTALE;
+   if (state.producer_quiesce_result || state.consumer_quiesce_result ||
+       state.reset_release_busy)
+      return -EBUSY;
+   state.reset_release_busy = true;
+   return 0;
+}
+
+int
+virgl_renderer_resource_unmap_for_reset(uint64_t generation, uint32_t res_handle)
+{
+   int ret = virgl_renderer_reset_release_acquire(generation);
+   if (ret)
+      return ret;
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res)
+      ret = -ENOENT;
+   else if (res->pipe_resource || res->mapped_from_pipe_resource)
+      ret = -EOPNOTSUPP;
+   else
+      ret = virgl_renderer_resource_unmap_internal(res);
+   state.reset_release_busy = false;
+   return ret;
+}
+
+int
+virgl_renderer_resource_detach_iov_for_reset(uint64_t generation, uint32_t res_handle,
+                                             struct iovec **iov, int *count)
+{
+   if (!iov || !count)
+      return -EINVAL;
+   int ret = virgl_renderer_reset_release_acquire(generation);
+   if (ret)
+      return ret;
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res) {
+      ret = -ENOENT;
+   } else if (res->pipe_resource) {
+      ret = -EOPNOTSUPP;
+   } else if (res->mapped) {
+      ret = -EBUSY;
+   } else {
+      struct iovec *detached_iov = (struct iovec *)res->iov;
+      int detached_count = res->iov_count;
+      virgl_resource_detach_iov(res);
+      *iov = detached_iov;
+      *count = detached_count;
+   }
+   state.reset_release_busy = false;
+   return ret;
+}
+
+int
+virgl_renderer_resource_unref_for_reset(uint64_t generation, uint32_t res_handle)
+{
+   int ret = virgl_renderer_reset_release_acquire(generation);
+   if (ret)
+      return ret;
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res) {
+      ret = -ENOENT;
+   } else if (res->pipe_resource) {
+      ret = -EOPNOTSUPP;
+   } else if (res->mapped || res->iov || res->iov_count) {
+      ret = -EBUSY;
+   } else {
+      ret = virgl_context_release_resource_for_reset(res, generation);
+      if (!ret)
+         virgl_resource_remove(res_handle);
+   }
+   state.reset_release_busy = false;
+   return ret;
+}
+
+int
+virgl_renderer_reap_remote_checked(uint64_t generation, int timeout_ms,
+                                    struct virgl_renderer_reset_reap_result *out)
+{
+   if (!out)
+      return -EINVAL;
+   *out = (struct virgl_renderer_reset_reap_result){
+      .generation = generation, .protocol_version = VIRGL_RENDERER_RESET_REAP_VERSION,
+      .status = -EINVAL,
+   };
+   if (!generation || timeout_ms <= 0)
+      return -EINVAL;
+   int ret = virgl_renderer_reset_release_acquire(generation);
+   if (ret) {
+      out->status = ret;
+      return ret;
+   }
+   if (state.remote_reap_attempted) {
+      *out = state.remote_reap_result;
+      state.reset_release_busy = false;
+      return out->status;
+   }
+   if (!state.proxy_initialized) {
+      ret = -EOPNOTSUPP;
+      goto finish;
+   }
+   ret = virgl_resource_table_validate_empty();
+   if (ret)
+      goto finish;
+   state.remote_reap_attempted = true;
+   state.remote_reap_result = *out;
+   state.remote_reap_result.status = -EINPROGRESS;
+#ifdef ENABLE_RENDER_SERVER
+   struct render_client_op_reset_checked_reply reply = { 0 };
+   ret = proxy_renderer_reap_checked(generation, timeout_ms, &reply);
+   bool valid = proxy_renderer_reap_reply_valid() &&
+                reply.generation == generation &&
+                reply.protocol_version == RENDER_RESET_CHECKED_VERSION &&
+                reply.status == ret &&
+                (ret ? reply.phase == 0 :
+                 (reply.phase == RENDER_RESET_RECORDS_REAPED &&
+                  !reply.remaining_count && !reply.failed_ctx_id));
+   if (valid) {
+      out->remote_reply_valid = 1;
+      out->reaped_count = reply.reaped_count;
+      out->remaining_count = reply.remaining_count;
+      out->failed_ctx_id = reply.failed_ctx_id;
+      if (!ret)
+         out->phase = VIRGL_RENDERER_RESET_RECORDS_REAPED;
+   } else if (!ret) {
+      ret = -EPROTO;
+   }
+#else
+   ret = -EOPNOTSUPP;
+#endif
+   out->status = ret;
+   state.remote_reap_result = *out;
+finish:
+   out->status = ret;
+   state.reset_release_busy = false;
+   return ret;
+}
+
+int
+virgl_renderer_retire_server_checked(uint64_t generation, int timeout_ms,
+                                     struct virgl_renderer_reset_server_result *out)
+{
+   if (!out)
+      return -EINVAL;
+   *out = (struct virgl_renderer_reset_server_result){
+      .generation = generation, .protocol_version = VIRGL_RENDERER_RESET_SERVER_VERSION,
+      .status = -EINVAL,
+   };
+   if (!generation || timeout_ms <= 0)
+      return -EINVAL;
+   int ret = virgl_renderer_reset_release_acquire(generation);
+   if (ret) {
+      out->status = ret;
+      return ret;
+   }
+   if (state.server_retirement_attempted) {
+      *out = state.server_retirement_result;
+      state.reset_release_busy = false;
+      return out->status;
+   }
+   if (!state.proxy_initialized || !state.remote_reap_attempted ||
+       state.remote_reap_result.status ||
+       state.remote_reap_result.generation != generation ||
+       state.remote_reap_result.remote_reply_valid != 1 ||
+       state.remote_reap_result.phase != VIRGL_RENDERER_RESET_RECORDS_REAPED) {
+      ret = -EBUSY;
+      goto finish;
+   }
+   ret = virgl_resource_table_validate_empty();
+   if (ret)
+      goto finish;
+   state.server_retirement_attempted = true;
+   state.server_retirement_result = *out;
+   state.server_retirement_result.status = -EINPROGRESS;
+#ifdef ENABLE_RENDER_SERVER
+   struct timespec start, now;
+   if (clock_gettime(CLOCK_MONOTONIC, &start)) {
+      ret = -errno;
+      goto cache;
+   }
+   ret = proxy_renderer_drain_jail_checked(generation, timeout_ms);
+   if (!ret) {
+      out->jail_empty = 1;
+      if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+         ret = -errno;
+         goto cache;
+      }
+      int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                        now.tv_nsec - start.tv_nsec;
+      int64_t remaining = ((int64_t)timeout_ms * 1000000 - elapsed) / 1000000;
+      if (elapsed < 0 || remaining <= 0 || remaining > timeout_ms) {
+         ret = elapsed < 0 ? -EIO : -ETIMEDOUT;
+         goto cache;
+      }
+      ret = proxy_renderer_reap_server_checked(generation, remaining);
+   }
+   if (!ret) {
+      if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+         ret = -errno;
+      } else {
+         int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                           now.tv_nsec - start.tv_nsec;
+         if (elapsed < 0 || elapsed >= (int64_t)timeout_ms * 1000000)
+            ret = elapsed < 0 ? -EIO : -ETIMEDOUT;
+      }
+      if (!ret) {
+         out->server_reaped = 1;
+         out->phase = VIRGL_RENDERER_RESET_SERVER_RETIRED;
+      }
+   }
+cache:
+#else
+   ret = -EOPNOTSUPP;
+#endif
+   out->status = ret;
+   state.server_retirement_result = *out;
+finish:
+   out->status = ret;
+   state.reset_release_busy = false;
+   return ret;
+}
+
+int
+virgl_renderer_quiesce_observers_for_reset(uint64_t generation, int timeout_ms)
+{
+   if (!generation || timeout_ms <= 0)
+      return -EINVAL;
+   int ret = virgl_renderer_reset_release_acquire(generation);
+   if (ret)
+      return ret;
+   if (state.observer_quiesce_attempted) {
+      ret = state.observer_quiesce_generation == generation ?
+            state.observer_quiesce_result : -ESTALE;
+      goto finish;
+   }
+   if (!state.server_retirement_attempted ||
+       state.server_retirement_result.generation != generation ||
+       state.server_retirement_result.protocol_version != VIRGL_RENDERER_RESET_SERVER_VERSION ||
+       state.server_retirement_result.status ||
+       state.server_retirement_result.phase != VIRGL_RENDERER_RESET_SERVER_RETIRED ||
+       state.server_retirement_result.jail_empty != 1 ||
+       state.server_retirement_result.server_reaped != 1) {
+      ret = -EBUSY;
+      goto finish;
+   }
+   state.observer_quiesce_attempted = true;
+   state.observer_quiesce_generation = generation;
+   state.observer_quiesce_result = -EINPROGRESS;
+   if (state.drm_initialized) {
+      /* This backend has no qualified global-observer stop contract. */
+      ret = -EOPNOTSUPP;
+      goto cache;
+   }
+   struct timespec start, now;
+   if (clock_gettime(CLOCK_MONOTONIC, &start)) {
+      ret = -errno;
+      goto cache;
+   }
+   ret = state.vrend_initialized ?
+      vrend_renderer_quiesce_observer_checked(timeout_ms) : 0;
+   if (ret > 0)
+      ret = -EPROTO;
+   if (!ret) {
+      if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+         ret = -errno;
+      } else {
+         int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                           now.tv_nsec - start.tv_nsec;
+         if (elapsed < 0 || elapsed >= (int64_t)timeout_ms * 1000000)
+            ret = elapsed < 0 ? -EIO : -ETIMEDOUT;
+      }
+   }
+cache:
+   state.observer_quiesce_result = ret;
+finish:
+   state.reset_release_busy = false;
+   return ret;
+}
+
+int
+virgl_renderer_cleanup_for_reset(uint64_t generation, void *cookie)
+{
+   if (!generation || !cookie)
+      return -EINVAL;
+   int ret = virgl_renderer_reset_release_acquire(generation);
+   if (ret)
+      return ret;
+   if (cookie != state.cookie) {
+      ret = -EINVAL;
+      goto finish;
+   }
+   if (!state.server_retirement_attempted ||
+       state.server_retirement_result.status ||
+       state.server_retirement_result.generation != generation ||
+       state.server_retirement_result.protocol_version != VIRGL_RENDERER_RESET_SERVER_VERSION ||
+       state.server_retirement_result.phase != VIRGL_RENDERER_RESET_SERVER_RETIRED ||
+       state.server_retirement_result.jail_empty != 1 ||
+       state.server_retirement_result.server_reaped != 1 ||
+       !state.observer_quiesce_attempted || state.observer_quiesce_result) {
+      ret = -EBUSY;
+      goto finish;
+   }
+   if (state.observer_quiesce_generation != generation) {
+      ret = -ESTALE;
+      goto finish;
+   }
+   ret = virgl_resource_table_validate_empty();
+   if (ret)
+      goto finish;
+   ret = virgl_renderer_cleanup_checked(cookie);
+   if (!ret) {
+      /* Cleanup cleared the old state and callback cookie. No new backend
+       * may dispatch until the caller's separate recovery-ready transaction. */
+      return 0;
+   }
+finish:
+   state.reset_release_busy = false;
    return ret;
 }
 
@@ -1398,6 +2034,9 @@ int virgl_renderer_resource_get_map_info(uint32_t res_handle, uint32_t *map_info
 int
 virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    TRACE_FUNC();
    struct virgl_resource *res = virgl_resource_lookup(res_id);
    if (!res)
@@ -1427,6 +2066,9 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
 int
 virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_blob_args *args)
 {
+   if (state.teardown_quarantined)
+      return -EBUSY;
+
    TRACE_FUNC();
    struct virgl_resource *res;
 
@@ -1484,6 +2126,10 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
 int
 virgl_renderer_export_fence(uint64_t client_fence_id, int *fd)
 {
+   if (state.teardown_quarantined) {
+      return -EBUSY;
+   }
+
    TRACE_FUNC();
 
    /* transfers FD ownership to caller */
@@ -1496,6 +2142,10 @@ virgl_renderer_export_fence(uint64_t client_fence_id, int *fd)
 
 int virgl_renderer_export_signalled_fence(void)
 {
+   if (state.teardown_quarantined) {
+      return -EBUSY;
+   }
+
    TRACE_FUNC();
 
    /* transfers FD ownership to caller, returns -1 on failure */
@@ -1519,6 +2169,10 @@ static int attach_in_fence_fd(struct virgl_context *ctx, int fence_fd)
  */
 int virgl_renderer_attach_fence(int ctx_id, int fence_fd)
 {
+   if (state.teardown_quarantined) {
+      return -EBUSY;
+   }
+
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
    if (!ctx)
@@ -1529,6 +2183,10 @@ int virgl_renderer_attach_fence(int ctx_id, int fence_fd)
 
 int virgl_renderer_get_fence_fd(uint64_t fence_id)
 {
+   if (state.teardown_quarantined) {
+      return -EBUSY;
+   }
+
    return virgl_fence_get_fd(fence_id);
 }
 
@@ -1582,6 +2240,10 @@ int virgl_renderer_submit_cmd2(void *buffer,
                                uint64_t *in_fence_ids,
                                uint32_t num_in_fences)
 {
+   if (state.teardown_quarantined) {
+      return -EBUSY;
+   }
+
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
    if (!ctx)

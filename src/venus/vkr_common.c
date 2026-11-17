@@ -231,10 +231,38 @@ static const struct debug_named_value vkr_debug_options[] = {
    { "validate", VKR_DEBUG_VALIDATE, "Force enabling the validation layer" },
    { "udmabuf", VKR_DEBUG_UDMABUF, "Force udmabuf for host visible memory" },
    { "gbm", VKR_DEBUG_GBM, "Force gbm for host visible memory" },
+   { "scanout", VKR_DEBUG_SCANOUT, "Trace Vulkan image and memory backing for scanout diagnosis" },
    DEBUG_NAMED_VALUE_END
 };
 
 uint32_t vkr_debug_flags;
+static atomic_uint vkr_scanout_trace_records;
+static atomic_uint_fast64_t vkr_scanout_trace_sequence;
+
+#define VKR_SCANOUT_TRACE_MAX_RECORDS 4096
+
+bool
+vkr_scanout_trace_permit(void)
+{
+   if (!VKR_DEBUG(SCANOUT))
+      return false;
+
+   const unsigned int record =
+      atomic_fetch_add_explicit(&vkr_scanout_trace_records, 1, memory_order_relaxed);
+   if (record < VKR_SCANOUT_TRACE_MAX_RECORDS)
+      return true;
+
+   if (record == VKR_SCANOUT_TRACE_MAX_RECORDS)
+      vkr_log("scanout_trace_limit reached; further records suppressed");
+   return false;
+}
+
+uint64_t
+vkr_scanout_trace_next_id(void)
+{
+   return atomic_fetch_add_explicit(&vkr_scanout_trace_sequence, 1,
+                                    memory_order_relaxed) + 1;
+}
 
 DEBUG_GET_ONCE_FLAGS_OPTION(vkr_debug_flags, "VKR_DEBUG", vkr_debug_options, 0)
 
@@ -242,6 +270,8 @@ void
 vkr_debug_init(void)
 {
    vkr_debug_flags = debug_get_option_vkr_debug_flags();
+   atomic_store_explicit(&vkr_scanout_trace_records, 0, memory_order_relaxed);
+   atomic_store_explicit(&vkr_scanout_trace_sequence, 0, memory_order_relaxed);
 }
 
 void

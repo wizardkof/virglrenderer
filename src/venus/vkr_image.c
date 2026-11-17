@@ -6,6 +6,8 @@
 #include "vkr_image.h"
 
 #include "vkr_image_gen.h"
+#include "vkr_device_memory.h"
+#include "vkr_context.h"
 #include "vkr_physical_device.h"
 
 static void
@@ -32,6 +34,25 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     */
 
    vkr_image_create_and_add(dispatch->data, args);
+   if (args->ret == VK_SUCCESS && args->pImage && args->pCreateInfo &&
+       vkr_scanout_trace_permit()) {
+      const VkImageCreateInfo *info = args->pCreateInfo;
+      const VkExternalMemoryImageCreateInfo *external = vkr_find_struct(
+         info->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+      struct vkr_image *image = vkr_image_from_handle(*args->pImage);
+      struct vkr_context *ctx = dispatch->data;
+      vkr_log("scanout_image_create context_id=%u device_id=%" PRIu64
+              " image_id=%" PRIu64
+              " format=%u extent=%ux%ux%u mip=%u layers=%u samples=%u"
+              " tiling=%u usage=0x%x flags=0x%x initial_layout=%u"
+              " external_handle_types=0x%x",
+              ctx->ctx_id, vkr_device_from_handle(args->device)->base.id,
+              image ? image->base.id : 0, info->format, info->extent.width,
+              info->extent.height, info->extent.depth, info->mipLevels,
+              info->arrayLayers, info->samples, info->tiling, info->usage,
+              info->flags, info->initialLayout,
+              external ? external->handleTypes : 0);
+   }
 }
 
 static void
@@ -94,26 +115,71 @@ vkr_dispatch_vkGetImageSparseMemoryRequirements2(
 }
 
 static void
-vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkBindImageMemory *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
+   struct vkr_image *image = vkr_image_from_handle(args->image);
+   struct vkr_device_memory *memory = vkr_device_memory_from_handle(args->memory);
+   const uint64_t image_id = image ? image->base.id : 0;
+   const uint64_t memory_id = memory ? memory->base.id : 0;
+   struct vkr_context *ctx = dispatch->data;
+   const uint64_t operation_id = VKR_DEBUG(SCANOUT)
+                                    ? vkr_scanout_trace_next_id()
+                                    : 0;
+
    vn_replace_vkBindImageMemory_args_handle(args);
    args->ret =
       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
+   if (vkr_scanout_trace_permit())
+      vkr_log("scanout_image_bind result=%d context_id=%u"
+              " device_id=%" PRIu64 " operation_id=%" PRIu64
+              " image_id=%" PRIu64
+              " memory_id=%" PRIu64 " memory_offset=%" PRIu64,
+              args->ret, ctx->ctx_id, dev->base.id, operation_id,
+              image_id, memory_id,
+              args->memoryOffset);
 }
 
 static void
-vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory2(struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkBindImageMemory2 *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+   struct vkr_context *ctx = dispatch->data;
+   const uint64_t operation_id = VKR_DEBUG(SCANOUT)
+                                    ? vkr_scanout_trace_next_id()
+                                    : 0;
+
+   if (VKR_DEBUG(SCANOUT)) {
+      for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+         if (!vkr_scanout_trace_permit())
+            break;
+         const VkBindImageMemoryInfo *bind = &args->pBindInfos[i];
+         struct vkr_image *image = vkr_image_from_handle(bind->image);
+         struct vkr_device_memory *memory =
+            vkr_device_memory_from_handle(bind->memory);
+         vkr_log("scanout_image_bind2_attempt context_id=%u"
+                 " device_id=%" PRIu64 " operation_id=%" PRIu64
+                 " index=%u image_id=%" PRIu64
+                 " memory_id=%" PRIu64 " memory_offset=%" PRIu64,
+                 ctx->ctx_id, dev->base.id, operation_id, i,
+                 image ? image->base.id : 0,
+                 memory ? memory->base.id : 0, bind->memoryOffset);
+      }
+   }
 
    vn_replace_vkBindImageMemory2_args_handle(args);
    args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+   if (vkr_scanout_trace_permit())
+      vkr_log("scanout_image_bind2_result result=%d context_id=%u"
+              " device_id=%" PRIu64 " operation_id=%" PRIu64
+              " bind_count=%u",
+              args->ret, ctx->ctx_id, dev->base.id, operation_id,
+              args->bindInfoCount);
 }
 
 static void

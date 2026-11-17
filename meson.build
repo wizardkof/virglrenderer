@@ -198,6 +198,12 @@ if thread_dep.found() and not with_host_windows
       args : '-D_GNU_SOURCE')
     conf_data.set('HAVE_PTHREAD_SETAFFINITY', 1)
   endif
+  if cc.has_function('pthread_clockjoin_np',
+      dependencies : thread_dep,
+      prefix : '#include <pthread.h>',
+      args : '-D_GNU_SOURCE')
+    conf_data.set('HAVE_PTHREAD_CLOCKJOIN_NP', 1)
+  endif
   if cc.has_header('pthread_np.h')
      conf_data.set('HAVE_PTHREAD_NP_H', 1)
   endif

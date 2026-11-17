@@ -8,6 +8,7 @@
 
 #include "vkr_common.h"
 #include "vkr_library.h"
+#include "vkr_reset_wait.h"
 
 #include "vn_protocol_renderer_defines.h"
 #include "vn_protocol_renderer_util.h"
@@ -45,6 +46,10 @@ enum vkr_context_validate_level {
 
 struct vkr_context {
    uint32_t ctx_id;
+
+   /* Owner-serialized, irreversible ingress freeze until context destruction. */
+   bool reset_wait_started;
+   struct vkr_reset_wait_result reset_wait_result;
    vkr_renderer_retire_fence_callback_type retire_fence;
 
    char *debug_name;
@@ -265,5 +270,11 @@ vkr_context_add_instance(struct vkr_context *ctx,
 
 void
 vkr_context_remove_instance(struct vkr_context *ctx, struct vkr_instance *instance);
+
+/* Caller must serialize renderer ingress. Stops and joins rings before device waits.
+ * This is not a reset-ready witness and has no timeout: DeviceWaitIdle may block.
+ */
+struct vkr_reset_wait_result
+vkr_context_wait_idle_for_reset(struct vkr_context *ctx, uint64_t generation);
 
 #endif /* VKR_CONTEXT_H */

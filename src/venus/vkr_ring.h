@@ -99,6 +99,10 @@ struct vkr_ring {
    bool prio_valid;
    int prio;
    atomic_bool started;
+   /* Owner-only witness: true exclusively after successful thrd_join. */
+   bool joined;
+   bool stop_requested;
+   bool join_attempted;
    atomic_bool pending_notify;
    atomic_bool monitor;
    uint64_t virtqueue_seqno;
@@ -114,6 +118,13 @@ vkr_ring_destroy(struct vkr_ring *ring);
 
 void
 vkr_ring_start(struct vkr_ring *ring);
+
+/* All three operations require the serialized context owner. */
+bool
+vkr_ring_request_stop(struct vkr_ring *ring);
+
+bool
+vkr_ring_join_stopped(struct vkr_ring *ring);
 
 bool
 vkr_ring_stop(struct vkr_ring *ring);

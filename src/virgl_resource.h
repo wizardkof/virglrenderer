@@ -130,6 +130,10 @@ virgl_resource_table_init(const struct virgl_resource_pipe_callbacks *callbacks)
 void
 virgl_resource_table_cleanup(void);
 
+/* Read-only initialized-empty gate, not a lifetime lease. */
+int
+virgl_resource_table_validate_empty(void);
+
 void
 virgl_resource_table_reset(void);
 

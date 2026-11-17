@@ -7,6 +7,7 @@
 #define PROXY_CONTEXT_H
 
 #include "proxy_common.h"
+#include "vkr_reset_wait.h"
 
 #include "c11/threads.h"
 #include "virgl_context.h"
@@ -29,6 +30,12 @@ struct proxy_context {
 
    struct proxy_client *client;
    struct proxy_socket socket;
+   /* Serializes complete request/reply operations; owner retains ctx lifetime. */
+   mtx_t channel_mutex;
+   /* Irreversible quarantine: no completion inferred from disconnect. */
+   atomic_bool quiesce_fences_held;
+   bool producers_quiesced;
+   uint64_t quiesce_generation;
 
    /* this tracks resources early attached in get_blob */
    struct hash_table *resource_table;
@@ -57,8 +64,21 @@ struct proxy_context {
       /* when VIRGL_RENDERER_ASYNC_FENCE_CB is also set */
       thrd_t thread;
       bool created;
-      bool stop;
+      bool join_attempted;
+      bool joined;
+      atomic_bool stop;
    } sync_thread;
 };
+
+/* Read-only exact-generation witness for the serialized context-table owner. */
+int
+proxy_context_reset_reap_ready(struct virgl_context *base, uint64_t generation);
+
+/* Exclusive channel owner only; true means valid reply, inspect status.
+ * No caller may treat this as reset-ready or free resources on timeout.
+ */
+bool
+proxy_context_quiesce(struct proxy_context *ctx, uint64_t generation,
+                       int timeout_ms, struct vkr_reset_wait_result *out);
 
 #endif /* PROXY_CONTEXT_H */

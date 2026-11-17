@@ -592,6 +592,9 @@ bool vrend_format_is_bgra(enum virgl_formats format);
 bool format_is_copy_compatible(enum virgl_formats src, enum virgl_formats dst,
                                unsigned int flags);
 
+/* Serialized renderer owner with dispatch held; stops/joins only the global
+ * observer. Failure retains its thread and synchronization owners. */
+int vrend_renderer_quiesce_observer_checked(int timeout_ms);
 void vrend_renderer_prepare_reset(void);
 void vrend_renderer_reset(void);
 void vrend_renderer_poll(void);

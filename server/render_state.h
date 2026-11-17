@@ -7,6 +7,7 @@
 #define RENDER_STATE_H
 
 #include "render_common.h"
+#include "vkr_reset_wait.h"
 
 bool
 render_state_init(uint32_t init_flags);
@@ -22,6 +23,10 @@ render_state_create_context(struct render_context *ctx,
 
 void
 render_state_destroy_context(uint32_t ctx_id);
+
+/* Owner-serialized device wait only; not a reset-ready or timeout contract. */
+struct vkr_reset_wait_result
+render_state_wait_idle_for_reset(uint32_t ctx_id, uint64_t generation);
 
 bool
 render_state_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);

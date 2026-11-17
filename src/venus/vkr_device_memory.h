@@ -15,6 +15,7 @@ struct vkr_device_memory {
    struct vkr_object base;
 
    struct vkr_device *device;
+   uint32_t context_id;
 
    bool might_export;
 

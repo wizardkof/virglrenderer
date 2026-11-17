@@ -29,6 +29,10 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <errno.h>
+#include <time.h>
+#ifdef HAVE_PTHREAD_CLOCKJOIN_NP
+#include <pthread.h>
+#endif
 #include "pipe/p_shader_tokens.h"
 
 #include "pipe/p_defines.h"
@@ -7199,6 +7203,59 @@ static GLenum tgsitargettogltarget(const enum pipe_texture_target target, int nr
       return PIPE_BUFFER;
    }
    return PIPE_BUFFER;
+}
+
+int
+vrend_renderer_quiesce_observer_checked(int timeout_ms)
+{
+   if (timeout_ms <= 0)
+      return -EINVAL;
+   if (!vrend_state.sync_thread)
+      return 0;
+#ifdef HAVE_PTHREAD_CLOCKJOIN_NP
+   struct timespec start, deadline, now;
+   if (thrd_equal(vrend_state.sync_thread, thrd_current()))
+      return -EDEADLK;
+   if (clock_gettime(CLOCK_MONOTONIC, &start))
+      return -errno;
+   deadline = start;
+   deadline.tv_sec += timeout_ms / 1000;
+   deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
+   if (deadline.tv_nsec >= 1000000000) {
+      deadline.tv_sec++;
+      deadline.tv_nsec -= 1000000000;
+   }
+   int lock = mtx_trylock(&vrend_state.fence_mutex);
+   if (lock != thrd_success)
+      return lock == thrd_busy ? -EBUSY : -EIO;
+   vrend_state.stop_sync_thread = true;
+   int signal = cnd_signal(&vrend_state.fence_cond);
+   mtx_unlock(&vrend_state.fence_mutex);
+   if (signal != thrd_success)
+      return -EIO;
+   /* Mesa POSIX thrd_t is pthread_t, as in the proxy observer's bounded join.
+    * Never detach/cancel or dispose mutexes while the callback owner lives. */
+   int ret = pthread_clockjoin_np(vrend_state.sync_thread, NULL,
+                                   CLOCK_MONOTONIC, &deadline);
+   if (ret)
+      return -ret;
+   /* Persist actual join before checking the enclosing budget. Even a late
+    * success cannot leave a stale joinable handle for a subsequent cleanup. */
+   vrend_state.sync_thread = 0;
+   cnd_destroy(&vrend_state.fence_cond);
+   mtx_destroy(&vrend_state.fence_mutex);
+   cnd_destroy(&vrend_state.poll_cond);
+   mtx_destroy(&vrend_state.poll_mutex);
+   if (clock_gettime(CLOCK_MONOTONIC, &now))
+      return -errno;
+   int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                     now.tv_nsec - start.tv_nsec;
+   if (elapsed < 0 || elapsed >= (int64_t)timeout_ms * 1000000)
+      return elapsed < 0 ? -EIO : -ETIMEDOUT;
+   return 0;
+#else
+   return -EOPNOTSUPP;
+#endif
 }
 
 static void vrend_free_sync_thread(void)

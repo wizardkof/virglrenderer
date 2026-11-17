@@ -380,6 +380,111 @@ VIRGL_EXPORT int virgl_renderer_resource_get_info(int res_handle,
 VIRGL_EXPORT int virgl_renderer_resource_get_info_ext(int res_handle,
                                                       struct virgl_renderer_resource_info_ext *info);
 
+#define VIRGL_RENDERER_HAS_CHECKED_TEARDOWN 1
+#define VIRGL_RENDERER_HAS_RESET_CONSUMER_QUIESCE 1
+#define VIRGL_RENDERER_HAS_RESET_RESOURCE_RELEASE 1
+
+#define VIRGL_RENDERER_HAS_RESET_REMOTE_REAP 1
+#define VIRGL_RENDERER_RESET_REAP_VERSION 1u
+#define VIRGL_RENDERER_RESET_RECORDS_REAPED 1u
+struct virgl_renderer_reset_reap_result {
+   uint64_t generation;
+   uint32_t protocol_version;
+   uint32_t phase;
+   int32_t status;
+   uint32_t reaped_count;
+   uint32_t remaining_count;
+   uint32_t failed_ctx_id;
+   uint32_t remote_reply_valid;
+};
+/* Requires exact successful producer/consumer phases and an empty local
+ * resource table. Retains context topology/quarantine. Success establishes
+ * only reap of this client's records, never GPU/reset readiness or resume.
+ */
+VIRGL_EXPORT int virgl_renderer_reap_remote_checked(
+   uint64_t generation, int timeout_ms, struct virgl_renderer_reset_reap_result *out);
+
+#define VIRGL_RENDERER_HAS_RESET_SERVER_RETIREMENT 1
+#define VIRGL_RENDERER_RESET_SERVER_VERSION 1u
+#define VIRGL_RENDERER_RESET_SERVER_RETIRED 1u
+struct virgl_renderer_reset_server_result {
+   uint64_t generation;
+   uint32_t protocol_version;
+   uint32_t phase;
+   int32_t status;
+   uint32_t jail_empty;
+   uint32_t server_reaped;
+};
+/* Exact successful record-reap generation required. One budget includes jail
+ * drainage and owned-server reap. Retains contexts/cookie/quarantine; no READY.
+ * Flag means qualified timely completion, not merely an observed late reap. */
+VIRGL_EXPORT int virgl_renderer_retire_server_checked(
+   uint64_t generation, int timeout_ms, struct virgl_renderer_reset_server_result *out);
+
+#define VIRGL_RENDERER_HAS_RESET_OBSERVER_QUIESCE 1
+/* Exact retired-server generation required; bounded global vrend observer
+ * stop/join, not a GL/GPU-idle or cleanup/readiness witness. Failure cached. */
+VIRGL_EXPORT int virgl_renderer_quiesce_observers_for_reset(
+   uint64_t generation, int timeout_ms);
+
+#define VIRGL_RENDERER_HAS_RESET_GENERATION_CLEANUP 1
+/* Destructive local commit after exact server and global-observer witnesses.
+ * Caller retains exclusive ownership/cookie on failure. Success clears old
+ * renderer state; caller must retain its dispatch/display hold. GL driver
+ * destruction is not interruptible: caller checks its enclosing deadline. */
+VIRGL_EXPORT int virgl_renderer_cleanup_for_reset(uint64_t generation, void *cookie);
+
+#define VIRGL_RENDERER_HAS_INSTANCE_SERIAL 1
+/* Serialized owner only. Nonzero identifies a fully initialized instance for
+ * this exact cookie, including while quarantined. Not a readiness/lifetime lease.
+ * Identity survives idempotent init and is never reused after cleanup. */
+VIRGL_EXPORT uint64_t virgl_renderer_get_instance_serial(void *cookie);
+
+/* Caller serializes renderer operations; query is not a lifetime lease. */
+VIRGL_EXPORT bool virgl_renderer_is_quarantined(void);
+
+/* Checked local teardown, NOT a GPU-idle/reset-ready witness. Caller must
+ * serialize renderer lifetime and retain cookie/callback/resources on error.
+ * After opting in, do not bypass an error via the legacy void operations.
+ * A checked reset leaves the renderer quarantined pending a ready contract.
+ */
+/* Producer-only barrier with cached generation/result; remains quarantined.
+ * One monotonic budget includes bounded local observer preparation and all
+ * producer waits. Unsupported bounded preparation fails closed.
+ * No GPU scanout/reset-ready assertion; caller keeps cookie/resources on error.
+ */
+VIRGL_EXPORT int virgl_renderer_quiesce_producers_checked(uint64_t generation,
+                                                         int timeout_ms);
+
+/* Requires successful producer quiescence for this exact generation. Callback
+ * must hold all consumers against new submissions and return 0 only after
+ * completion, or a negative errno. Keep that hold until checked recovery.
+ * Caller retains context/resource lifetime from command recording through
+ * this callback and any later teardown; callback success is not a lease.
+ * Results (including pending/error) are cached; ordinary dispatch stays held.
+ * A timeout is a wait bound, not preemption of a blocked external driver call.
+ */
+VIRGL_EXPORT int virgl_renderer_quiesce_consumers_checked(
+   uint64_t generation, int timeout_ms,
+   int (*callback)(void *data, int remaining_ms), void *data);
+
+/* Local resource release only after BOTH phases for the exact generation.
+ * Caller must keep consumers held, resource/context topology stable, and prove
+ * CPU/RCU mapping users drained BEFORE unmap. Returned IOVs remain caller-owned;
+ * these APIs never free guest RAM. Pipe/GL resources are unqualified and refused.
+ * Ordinary APIs remain quarantined; no reset/remote-worker readiness asserted.
+ */
+VIRGL_EXPORT int virgl_renderer_resource_unmap_for_reset(uint64_t generation,
+                                                        uint32_t res_handle);
+VIRGL_EXPORT int virgl_renderer_resource_detach_iov_for_reset(
+   uint64_t generation, uint32_t res_handle, struct iovec **iov, int *count);
+VIRGL_EXPORT int virgl_renderer_resource_unref_for_reset(uint64_t generation,
+                                                        uint32_t res_handle);
+
+VIRGL_EXPORT int virgl_renderer_context_destroy_checked(uint32_t handle);
+VIRGL_EXPORT int virgl_renderer_cleanup_checked(void *cookie);
+VIRGL_EXPORT int virgl_renderer_reset_checked(void);
+
 VIRGL_EXPORT void virgl_renderer_cleanup(void *cookie);
 
 /* reset the rendererer - destroy all contexts and resource */

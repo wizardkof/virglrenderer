@@ -354,6 +354,9 @@ vkr_ring_start(struct vkr_ring *ring)
    int ret;
 
    assert(!ring->started);
+   ring->joined = false;
+   ring->stop_requested = false;
+   ring->join_attempted = false;
    ring->started = true;
    ret = thrd_create(&ring->thread, vkr_ring_thread, ring);
    if (ret != thrd_success)
@@ -361,21 +364,42 @@ vkr_ring_start(struct vkr_ring *ring)
 }
 
 bool
-vkr_ring_stop(struct vkr_ring *ring)
+vkr_ring_request_stop(struct vkr_ring *ring)
 {
    mtx_lock(&ring->mutex);
-   if (thrd_equal(ring->thread, thrd_current())) {
+   if (ring->joined || ring->stop_requested) {
+      mtx_unlock(&ring->mutex);
+      return true;
+   }
+   /* A failed create has no valid thread. Never inspect its thread handle. */
+   if (!ring->started || thrd_equal(ring->thread, thrd_current())) {
       mtx_unlock(&ring->mutex);
       return false;
    }
-   assert(ring->started);
+   ring->stop_requested = true;
    ring->started = false;
    cnd_signal(&ring->cond);
    mtx_unlock(&ring->mutex);
-
-   thrd_join(ring->thread, NULL);
-
    return true;
+}
+
+bool
+vkr_ring_join_stopped(struct vkr_ring *ring)
+{
+   /* Owner-only state: no second join after either success or failure. */
+   if (ring->joined)
+      return true;
+   if (!ring->stop_requested || ring->join_attempted)
+      return false;
+   ring->join_attempted = true;
+   ring->joined = thrd_join(ring->thread, NULL) == thrd_success;
+   return ring->joined;
+}
+
+bool
+vkr_ring_stop(struct vkr_ring *ring)
+{
+   return vkr_ring_request_stop(ring) && vkr_ring_join_stopped(ring);
 }
 
 void

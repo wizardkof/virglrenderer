@@ -72,6 +72,8 @@ proxy_socket_fini(struct proxy_socket *socket)
 bool
 proxy_socket_is_connected(const struct proxy_socket *socket)
 {
+   if (socket->fd < 0)
+      return false;
    struct pollfd poll_fd = {
       .fd = socket->fd,
    };
@@ -263,6 +265,65 @@ proxy_socket_receive_reply_internal(struct proxy_socket *socket,
    }
 
    return true;
+}
+
+bool
+proxy_socket_send_request_bounded(struct proxy_socket *socket, const void *data,
+                                  size_t size, int timeout_ms)
+{
+   if (socket->fd < 0)
+      return false;
+#ifndef __APPLE__
+   int type = 0;
+   socklen_t type_size = sizeof(type);
+   if (data && size && timeout_ms > 0 &&
+       getsockopt(socket->fd, SOL_SOCKET, SO_TYPE, &type, &type_size) == 0 &&
+       type == SOCK_SEQPACKET) {
+      struct pollfd pfd = { .fd = socket->fd, .events = POLLOUT };
+      if (poll(&pfd, 1, timeout_ms) == 1 && (pfd.revents & POLLOUT)) {
+         const ssize_t sent = send(socket->fd, data, size, MSG_DONTWAIT | MSG_NOSIGNAL);
+         if (sent > 0 && (size_t)sent == size)
+            return true;
+      }
+   }
+#endif
+   close(socket->fd);
+   socket->fd = -1;
+   return false;
+}
+
+bool
+proxy_socket_receive_reply_bounded(struct proxy_socket *socket, void *data,
+                                   size_t size, int timeout_ms)
+{
+   if (socket->fd < 0)
+      return false;
+#ifndef __APPLE__
+   /* Do not extend the wait on EINTR. Owner serialization is required so no
+    * other reader can consume the reply between poll and nonblocking recv.
+    */
+   int type = 0;
+   socklen_t type_size = sizeof(type);
+   if (data && size && timeout_ms > 0 &&
+       getsockopt(socket->fd, SOL_SOCKET, SO_TYPE, &type, &type_size) == 0 &&
+       type == SOCK_SEQPACKET) {
+      struct pollfd pfd = { .fd = socket->fd, .events = POLLIN };
+      if (poll(&pfd, 1, timeout_ms) == 1 && (pfd.revents & POLLIN)) {
+         struct iovec iov = { .iov_base = data, .iov_len = size };
+         struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+         const ssize_t received = recvmsg(socket->fd, &msg, MSG_DONTWAIT);
+         if (received > 0 && (size_t)received == size &&
+             !(msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)))
+            return true;
+      }
+   }
+#endif
+   /* Stream framing is not implemented here. Fail closed on unsupported
+    * platforms or malformed/late replies, without claiming worker termination.
+    */
+   close(socket->fd);
+   socket->fd = -1;
+   return false;
 }
 
 bool

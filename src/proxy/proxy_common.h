@@ -36,6 +36,12 @@ struct proxy_renderer {
 
    struct proxy_server *server;
    struct proxy_client *client;
+   /* Populated only by a validated server-jail receipt, not by
+    * RECORDS_REAPED (which covers current client records only). */
+   uint64_t server_jail_empty_generation;
+   bool server_reap_attempted;
+   uint64_t server_reap_generation;
+   int server_reap_result;
 };
 
 extern struct proxy_renderer proxy_renderer;

@@ -25,6 +25,7 @@
 #include "virgl_context.h"
 
 #include <errno.h>
+#include <time.h>
 
 #ifndef WIN32
 #include "util/libsync.h"
@@ -75,6 +76,162 @@ virgl_context_add(struct virgl_context *ctx)
    const enum pipe_error err = util_hash_table_set(
          virgl_context_table, uintptr_to_pointer(ctx->ctx_id), ctx);
    return err == PIPE_OK ? 0 : ENOMEM;
+}
+
+struct virgl_context_quiesce_args {
+   uint64_t generation;
+   int64_t deadline_ns;
+   int error;
+};
+
+static enum pipe_error
+virgl_context_quiesce_entry(UNUSED void *key, void *value, void *data)
+{
+   struct virgl_context *ctx = value;
+   struct virgl_context_quiesce_args *args = data;
+   if (!ctx->quiesce_producers) {
+      args->error = -EOPNOTSUPP;
+      return PIPE_ERROR;
+   }
+   struct timespec now;
+   if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+      args->error = -EIO;
+      return PIPE_ERROR;
+   }
+   int64_t now_ns = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+   int64_t remaining_ms = (args->deadline_ns - now_ns) / 1000000;
+   if (remaining_ms <= 0) {
+      args->error = -ETIMEDOUT;
+      return PIPE_ERROR;
+   }
+   if (ctx->prepare_destroy || ctx->prepare_destroy_bounded) {
+      if (!ctx->prepare_destroy_bounded) {
+         args->error = -EOPNOTSUPP;
+         return PIPE_ERROR;
+      }
+      const bool prepared = ctx->prepare_destroy_bounded(ctx, (int)remaining_ms);
+      if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+         args->error = -EIO;
+         return PIPE_ERROR;
+      }
+      now_ns = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+      remaining_ms = (args->deadline_ns - now_ns) / 1000000;
+      if (remaining_ms <= 0) {
+         args->error = -ETIMEDOUT;
+         return PIPE_ERROR;
+      }
+      if (!prepared) {
+         args->error = -EBUSY;
+         return PIPE_ERROR;
+      }
+   }
+   args->error = ctx->quiesce_producers(ctx, args->generation, (int)remaining_ms);
+   if (args->error)
+      return PIPE_ERROR;
+   if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+      args->error = -EIO;
+      return PIPE_ERROR;
+   }
+   now_ns = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+   if (now_ns > args->deadline_ns) {
+      args->error = -ETIMEDOUT;
+      return PIPE_ERROR;
+   }
+   return PIPE_OK;
+}
+
+int
+virgl_context_quiesce_all(uint64_t generation, int timeout_ms)
+{
+   if (!generation || timeout_ms <= 0)
+      return -EINVAL;
+   struct timespec now;
+   if (clock_gettime(CLOCK_MONOTONIC, &now))
+      return -EIO;
+   const int64_t start_ns = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+   const int64_t budget_ns = (int64_t)timeout_ms * 1000000;
+   if (start_ns < 0 || start_ns > INT64_MAX - budget_ns)
+      return -EINVAL;
+   struct virgl_context_quiesce_args args = {
+      .generation = generation, .deadline_ns = start_ns + budget_ns,
+   };
+   if (util_hash_table_foreach(virgl_context_table, virgl_context_quiesce_entry,
+                               &args) != PIPE_OK)
+      return args.error ? args.error : -EIO;
+   return 0;
+}
+
+struct virgl_context_reset_release_args {
+   struct virgl_resource *res;
+   uint64_t generation;
+   bool validate_only;
+   int error;
+};
+
+static enum pipe_error
+virgl_context_reset_release_entry(UNUSED void *key, void *value, void *data)
+{
+   struct virgl_context *ctx = value;
+   struct virgl_context_reset_release_args *args = data;
+   if (!ctx->release_resource_for_reset) {
+      args->error = -EOPNOTSUPP;
+      return PIPE_ERROR;
+   }
+   args->error = ctx->release_resource_for_reset(ctx, args->res,
+                                                 args->generation,
+                                                 args->validate_only);
+   if (args->error > 0)
+      args->error = -EPROTO;
+   return args->error ? PIPE_ERROR : PIPE_OK;
+}
+
+int
+virgl_context_release_resource_for_reset(struct virgl_resource *res,
+                                         uint64_t generation)
+{
+   if (!res || !generation)
+      return -EINVAL;
+   struct virgl_context_reset_release_args args = {
+      .res = res, .generation = generation, .validate_only = true,
+   };
+   if (util_hash_table_foreach(virgl_context_table, virgl_context_reset_release_entry,
+                               &args) != PIPE_OK)
+      return args.error ? args.error : -EIO;
+   /* All context owners are serialized/quiesced. An unexpected commit refusal
+    * can leave earlier local markers withdrawn, but the root resource remains
+    * owned by the caller; never infer complete release from that failure.
+    */
+   args.validate_only = false;
+   if (util_hash_table_foreach(virgl_context_table, virgl_context_reset_release_entry,
+                               &args) != PIPE_OK)
+      return args.error ? args.error : -EIO;
+   return 0;
+}
+
+static enum pipe_error
+virgl_context_prepare_destroy_entry(UNUSED void *key, void *value, UNUSED void *data)
+{
+   struct virgl_context *ctx = value;
+   return !ctx->prepare_destroy || ctx->prepare_destroy(ctx) ? PIPE_OK : PIPE_ERROR;
+}
+
+bool
+virgl_context_prepare_destroy_all(void)
+{
+   return util_hash_table_foreach(virgl_context_table,
+                                  virgl_context_prepare_destroy_entry, NULL) == PIPE_OK;
+}
+
+bool
+virgl_context_remove_checked(uint32_t ctx_id)
+{
+   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
+   if (!ctx)
+      return true;
+   if (ctx->prepare_destroy && !ctx->prepare_destroy(ctx))
+      return false;
+   util_hash_table_remove(virgl_context_table, uintptr_to_pointer(ctx_id));
+   return true;
 }
 
 void

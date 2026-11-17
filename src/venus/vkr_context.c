@@ -137,12 +137,69 @@ vkr_context_init_proc_table(struct vkr_context *ctx)
    vn_util_init_global_proc_table(ctx->get_proc_addr, &ctx->proc_table);
 }
 
+struct vkr_reset_wait_result
+vkr_context_wait_idle_for_reset(struct vkr_context *ctx, uint64_t generation)
+{
+   struct vkr_reset_wait_result result = {
+      .status = VKR_RESET_WAIT_IDLE,
+      .context_id = ctx->ctx_id,
+      .generation = generation,
+   };
+   if (!generation) {
+      result.status = VKR_RESET_WAIT_INVALID_GENERATION;
+      return result;
+   }
+   if (ctx->reset_wait_started) {
+      if (ctx->reset_wait_result.generation == generation)
+         return ctx->reset_wait_result;
+      result.status = VKR_RESET_WAIT_GENERATION_MISMATCH;
+      return result;
+   }
+   /* The serialized owner freezes ingress before touching rings. Request all
+    * stops before waiting on any one thread; retain every object on failure.
+    * These waits are synchronous: the worker protocol still needs supervision.
+    */
+   ctx->reset_wait_started = true;
+   bool stopped = true;
+   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
+      if (!vkr_ring_request_stop(ring))
+         stopped = false;
+   }
+   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
+      if (!vkr_ring_join_stopped(ring))
+         stopped = false;
+   }
+   if (!stopped) {
+      result.status = VKR_RESET_WAIT_RING_STOP_FAILED;
+      ctx->reset_wait_result = result;
+      return result;
+   }
+   if (ctx->instance) {
+      for (uint32_t i = 0; i < ctx->instance->physical_device_count; i++) {
+         struct vkr_physical_device *physical = ctx->instance->physical_devices[i];
+         list_for_each_entry (struct vkr_device, dev, &physical->devices, base.track_head) {
+            VkResult waited = dev->proc_table.DeviceWaitIdle(dev->base.handle.device);
+            result.devices_waited++;
+            if (waited != VK_SUCCESS && result.status == VKR_RESET_WAIT_IDLE) {
+               result.status = VKR_RESET_WAIT_DEVICE_ERROR;
+               result.vk_result = waited;
+            }
+         }
+      }
+   }
+   ctx->reset_wait_result = result;
+   return result;
+}
+
 bool
 vkr_context_submit_fence(struct vkr_context *ctx,
                          uint32_t flags,
                          uint32_t ring_idx,
                          uint64_t fence_id)
 {
+   if (ctx->reset_wait_started)
+      return false;
+
    /* retire fence on cpu timeline directly */
    if (ring_idx == 0) {
       ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
@@ -165,6 +222,9 @@ vkr_context_submit_fence(struct vkr_context *ctx,
 bool
 vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
 {
+   if (ctx->reset_wait_started)
+      return false;
+
    /* CS error is considered fatal (destroy the context?) */
    if (vkr_context_get_fatal(ctx)) {
       vkr_log("submit_cmd: early bail due to fatal decoder state");

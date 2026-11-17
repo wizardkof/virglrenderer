@@ -403,6 +403,30 @@ render_socket_send_reply_internal(struct render_socket *socket,
    return render_socket_sendmsg(socket, &msg);
 }
 
+/* No-FD private checked reply. Never use the legacy retrying/blocking send
+ * loop for a bounded reset attempt. Failure leaves FD disposal to its owner.
+ */
+bool
+render_socket_send_reply_nowait(struct render_socket *socket, const void *data,
+                                size_t size)
+{
+#ifndef __APPLE__
+   int type = 0;
+   socklen_t len = sizeof(type);
+   if (!socket || socket->fd < 0 || !data || !size ||
+       getsockopt(socket->fd, SOL_SOCKET, SO_TYPE, &type, &len) ||
+       type != SOCK_SEQPACKET)
+      return false;
+   ssize_t sent = send(socket->fd, data, size, MSG_DONTWAIT | MSG_NOSIGNAL);
+   return sent > 0 && (size_t)sent == size;
+#else
+   (void)socket;
+   (void)data;
+   (void)size;
+   return false;
+#endif
+}
+
 bool
 render_socket_send_reply(struct render_socket *socket, const void *data, size_t size)
 {

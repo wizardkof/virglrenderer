@@ -27,6 +27,17 @@ proxy_socket_fini(struct proxy_socket *socket);
 bool
 proxy_socket_is_connected(const struct proxy_socket *socket);
 
+/* Exclusive channel owner only. Linux seqpacket/no-FD reply, finite wait.
+ * Any failure closes and invalidates the channel; never retry a late reply.
+ */
+bool
+proxy_socket_send_request_bounded(struct proxy_socket *socket, const void *data,
+                                  size_t size, int timeout_ms);
+
+bool
+proxy_socket_receive_reply_bounded(struct proxy_socket *socket, void *data,
+                                   size_t size, int timeout_ms);
+
 bool
 proxy_socket_receive_reply(struct proxy_socket *socket, void *data, size_t size);
 

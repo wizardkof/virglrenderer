@@ -13,6 +13,7 @@
 
 #include "virgl_resource.h"
 #include "virglrenderer.h"
+#include "vkr_reset_wait.h"
 
 #define VKR_RENDERER_THREAD_SYNC (1u << 0)
 #define VKR_RENDERER_ASYNC_FENCE_CB (1u << 1)
@@ -43,6 +44,10 @@ vkr_renderer_create_context(uint32_t ctx_id,
 
 void
 vkr_renderer_destroy_context(uint32_t ctx_id);
+
+/* Owner-serialized device wait only; not a reset-ready or timeout contract. */
+struct vkr_reset_wait_result
+vkr_renderer_wait_idle_for_reset(uint32_t ctx_id, uint64_t generation);
 
 bool
 vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);

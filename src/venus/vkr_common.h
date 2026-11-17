@@ -118,6 +118,7 @@ enum vkr_debug_flags {
    VKR_DEBUG_VALIDATE = 1 << 0,
    VKR_DEBUG_UDMABUF = 1 << 1,
    VKR_DEBUG_GBM = 1 << 2,
+   VKR_DEBUG_SCANOUT = 1 << 3,
 };
 
 /* base class for all objects */
@@ -188,6 +189,12 @@ vkr_debug_init(void);
 
 void
 vkr_log(const char *fmt, ...);
+
+bool
+vkr_scanout_trace_permit(void);
+
+uint64_t
+vkr_scanout_trace_next_id(void);
 
 static inline uint32_t
 vkr_api_version_cap_minor(uint32_t version, uint32_t cap)

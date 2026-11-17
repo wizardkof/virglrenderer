@@ -7,6 +7,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -16,6 +17,107 @@
 #include "util/bitscan.h"
 
 #include "proxy_client.h"
+
+static mtx_t *
+proxy_context_channel_lock(struct proxy_context *ctx)
+{
+   return mtx_lock(&ctx->channel_mutex) == thrd_success ? &ctx->channel_mutex : NULL;
+}
+
+static void
+proxy_context_channel_unlock(mtx_t **mutex)
+{
+   if (*mutex)
+      mtx_unlock(*mutex);
+}
+
+#define SCOPE_LOCK_CHANNEL(ctx) \
+   mtx_t *_channel_lock __attribute__((cleanup(proxy_context_channel_unlock), unused)) = \
+      proxy_context_channel_lock(ctx)
+
+#define SCOPE_TRY_LOCK_CHANNEL(ctx) \
+   mtx_t *_channel_lock __attribute__((cleanup(proxy_context_channel_unlock), unused)) = \
+      mtx_trylock(&(ctx)->channel_mutex) == thrd_success ? &(ctx)->channel_mutex : NULL
+
+bool
+proxy_context_quiesce(struct proxy_context *ctx, uint64_t generation,
+                       int timeout_ms, struct vkr_reset_wait_result *out)
+{
+   SCOPE_TRY_LOCK_CHANNEL(ctx);
+   if (!_channel_lock) {
+      return false;
+   }
+
+   /* The exclusive channel owner must exclude all other context operations.
+    * A true result means a validated reply, NOT successful GPU recovery.
+    */
+   if (!generation || timeout_ms <= 0 || !out || ctx->socket.fd < 0 ||
+       (ctx->sync_thread.created && !ctx->sync_thread.joined))
+      return false;
+   /* The async poller caches this fd. Only a confirmed preparation join
+    * permits closing it; created alone never establishes that witness.
+    */
+   atomic_store(&ctx->quiesce_fences_held, true);
+   struct timespec start, now;
+   if (clock_gettime(CLOCK_MONOTONIC, &start))
+      goto fail;
+   const struct render_context_op_quiesce_request req = {
+      .header = { .op = RENDER_CONTEXT_OP_QUIESCE },
+      .protocol_version = RENDER_QUIESCE_PROTOCOL_VERSION,
+      .generation = generation,
+   };
+   if (!proxy_socket_send_request_bounded(&ctx->socket, &req, sizeof(req), timeout_ms))
+      return false;
+   if (clock_gettime(CLOCK_MONOTONIC, &now))
+      goto fail;
+   const int64_t elapsed_ns = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                              now.tv_nsec - start.tv_nsec;
+   const int64_t remaining_ms = ((int64_t)timeout_ms * 1000000 - elapsed_ns) / 1000000;
+   if (elapsed_ns < 0 || remaining_ms <= 0 || remaining_ms > timeout_ms)
+      goto fail;
+   struct render_context_op_quiesce_reply reply;
+   if (!proxy_socket_receive_reply_bounded(&ctx->socket, &reply, sizeof(reply),
+                                            (int)remaining_ms))
+      return false;
+   if (clock_gettime(CLOCK_MONOTONIC, &now))
+      goto fail;
+   const int64_t total_ns = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                            now.tv_nsec - start.tv_nsec;
+   if (total_ns < 0 || total_ns > (int64_t)timeout_ms * 1000000)
+      goto fail;
+   if (reply.ctx_id != ctx->base.ctx_id || reply.generation != generation ||
+       reply.phase != RENDER_QUIESCE_ATTEMPT_FINISHED ||
+       reply.protocol_version != RENDER_QUIESCE_PROTOCOL_VERSION)
+      goto fail;
+   switch (reply.status) {
+   case VKR_RESET_WAIT_IDLE:
+      if (reply.vk_result)
+         goto fail;
+      break;
+   case VKR_RESET_WAIT_DEVICE_ERROR:
+      if (!reply.vk_result)
+         goto fail;
+      break;
+   case VKR_RESET_WAIT_RING_STOP_FAILED:
+   case VKR_RESET_WAIT_CONTEXT_MISSING:
+   case VKR_RESET_WAIT_GENERATION_MISMATCH:
+      if (reply.vk_result || reply.devices_waited)
+         goto fail;
+      break;
+   default:
+      goto fail;
+   }
+   *out = (struct vkr_reset_wait_result) {
+      .status = reply.status, .context_id = reply.ctx_id,
+      .generation = reply.generation, .devices_waited = reply.devices_waited,
+      .vk_result = reply.vk_result,
+   };
+   return true;
+fail:
+   close(ctx->socket.fd);
+   ctx->socket.fd = -1;
+   return false;
+}
 
 struct proxy_fence {
    uint32_t flags;
@@ -106,6 +208,11 @@ proxy_context_retire_timeline_fences_locked(struct proxy_context *ctx,
                                             uint32_t ring_idx,
                                             uint32_t cur_seqno)
 {
+   /* Timeout/disconnect is not a completion witness. Retain pending evidence
+    * throughout quiescence, even if the shared timeline later changes.
+    */
+   if (atomic_load(&ctx->quiesce_fences_held))
+      return false;
    struct proxy_timeline *timeline = &ctx->timelines[ring_idx];
    bool force_retire_all = false;
 
@@ -178,7 +285,7 @@ proxy_context_sync_thread(void *arg)
 
    assert(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB);
 
-   while (!ctx->sync_thread.stop) {
+   while (!atomic_load(&ctx->sync_thread.stop)) {
       const int ret = poll(poll_fds, ARRAY_SIZE(poll_fds), -1);
       if (ret <= 0) {
          if (ret < 0 && (errno == EINTR || errno == EAGAIN))
@@ -188,6 +295,12 @@ proxy_context_sync_thread(void *arg)
          break;
       }
 
+      /* A shutdown wake is not a new completion notification. Recheck after
+       * poll before entering retirement; an already-running callback still
+       * requires the owner's join before any object/channel destruction.
+       */
+      if (atomic_load(&ctx->sync_thread.stop))
+         break;
       proxy_context_retire_fences_internal(ctx);
    }
 
@@ -201,6 +314,14 @@ proxy_context_submit_fence(struct virgl_context *base,
                            uint64_t fence_id)
 {
    struct proxy_context *ctx = (struct proxy_context *)base;
+   SCOPE_LOCK_CHANNEL(ctx);
+   if (!_channel_lock) {
+      return -EIO;
+   }
+
+   if (atomic_load(&ctx->quiesce_fences_held))
+      return -EIO;
+
    const uint64_t old_busy_mask = ctx->timeline_busy_mask;
 
    if (ring_idx >= PROXY_CONTEXT_TIMELINE_COUNT)
@@ -270,6 +391,14 @@ static int
 proxy_context_submit_cmd(struct virgl_context *base, const void *buffer, size_t size)
 {
    struct proxy_context *ctx = (struct proxy_context *)base;
+   SCOPE_LOCK_CHANNEL(ctx);
+   if (!_channel_lock) {
+      return -EIO;
+   }
+
+   if (atomic_load(&ctx->quiesce_fences_held))
+      return -EIO;
+
 
    if (!size)
       return 0;
@@ -350,6 +479,16 @@ proxy_context_get_blob(struct virgl_context *base,
     * attach_resource callback.
     */
    struct proxy_context *ctx = (struct proxy_context *)base;
+   SCOPE_LOCK_CHANNEL(ctx);
+   if (!_channel_lock) {
+      return -EIO;
+   }
+
+   if (atomic_load(&ctx->quiesce_fences_held)) {
+      proxy_log("proxy_context_get_blob: refused during quiescence for ctx %u", ctx->base.ctx_id);
+      return -EIO;
+   }
+
 
    const struct render_context_op_create_resource_request req = {
       .header.op = RENDER_CONTEXT_OP_CREATE_RESOURCE,
@@ -429,6 +568,17 @@ static void
 proxy_context_detach_resource(struct virgl_context *base, struct virgl_resource *res)
 {
    struct proxy_context *ctx = (struct proxy_context *)base;
+   SCOPE_LOCK_CHANNEL(ctx);
+   if (!_channel_lock) {
+      proxy_log("channel lock failed");
+      return;
+   }
+
+   if (atomic_load(&ctx->quiesce_fences_held)) {
+      proxy_log("proxy_context_detach_resource: refused during quiescence for ctx %u", ctx->base.ctx_id);
+      return;
+   }
+
    const uint32_t res_id = res->res_id;
 
    /* avoid detaching resource not belonging to this context */
@@ -449,6 +599,17 @@ static void
 proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource *res)
 {
    struct proxy_context *ctx = (struct proxy_context *)base;
+   SCOPE_LOCK_CHANNEL(ctx);
+   if (!_channel_lock) {
+      proxy_log("channel lock failed");
+      return;
+   }
+
+   if (atomic_load(&ctx->quiesce_fences_held)) {
+      proxy_log("proxy_context_attach_resource: refused during quiescence for ctx %u", ctx->base.ctx_id);
+      return;
+   }
+
    const uint32_t res_id = res->res_id;
 
    /* avoid importing resources created from RENDER_CONTEXT_OP_CREATE_RESOURCE */
@@ -507,22 +668,192 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
    proxy_context_resource_add(ctx, res_id);
 }
 
+static int
+proxy_context_quiesce_producers(struct virgl_context *base, uint64_t generation,
+                                 int remaining_ms)
+{
+   struct proxy_context *ctx = (struct proxy_context *)base;
+   ctx->producers_quiesced = false;
+   ctx->quiesce_generation = 0;
+   struct vkr_reset_wait_result result;
+   if (!proxy_context_quiesce(ctx, generation, remaining_ms, &result))
+      return -EIO;
+   if (result.status != VKR_RESET_WAIT_IDLE) {
+      proxy_log("producer quiescence failed for ctx %u: status %u VkResult %d",
+                base->ctx_id, result.status, result.vk_result);
+      return -EIO;
+   }
+   ctx->producers_quiesced = true;
+   ctx->quiesce_generation = generation;
+   return 0;
+}
+
+static int
+proxy_context_release_resource_for_reset(struct virgl_context *base,
+                                          struct virgl_resource *res,
+                                          uint64_t generation, bool validate_only)
+{
+   struct proxy_context *ctx = (struct proxy_context *)base;
+   SCOPE_TRY_LOCK_CHANNEL(ctx);
+   if (!_channel_lock)
+      return -EBUSY;
+   if (!res || !generation)
+      return -EINVAL;
+   if (!atomic_load(&ctx->quiesce_fences_held) || !ctx->producers_quiesced ||
+       (ctx->sync_thread.created && !ctx->sync_thread.joined))
+      return -EBUSY;
+   if (ctx->quiesce_generation != generation)
+      return -ESTALE;
+   if (!ctx->resource_table)
+      return -EIO;
+   if (!validate_only) {
+      /* Rings/observer stopped and producer idle for this generation. Withdraw
+       * only our local marker; no wire command can restart the quiet worker.
+       * Server-side imported FD references remain until its separate teardown.
+       */
+      proxy_context_resource_remove(ctx, res->res_id);
+   }
+   return 0;
+}
+
+/* A timeout retains the live thread and its context; never detach/cancel it.
+ * Mesa's POSIX C11 compatibility layer defines thrd_t as pthread_t.  Refuse
+ * on platforms without a monotonic bounded join instead of blocking forever.
+ */
+static int
+proxy_context_join_observer_bounded(struct proxy_context *ctx, int timeout_ms)
+{
+#ifdef HAVE_PTHREAD_CLOCKJOIN_NP
+   struct timespec deadline;
+   if (timeout_ms <= 0)
+      return EINVAL;
+   if (clock_gettime(CLOCK_MONOTONIC, &deadline))
+      return errno ? errno : EIO;
+   deadline.tv_sec += timeout_ms / 1000;
+   deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
+   if (deadline.tv_nsec >= 1000000000) {
+      deadline.tv_sec++;
+      deadline.tv_nsec -= 1000000000;
+   }
+   return pthread_clockjoin_np(ctx->sync_thread.thread, NULL,
+                                CLOCK_MONOTONIC, &deadline);
+#else
+   (void)ctx;
+   (void)timeout_ms;
+   return ENOTSUP;
+#endif
+}
+
+static bool
+proxy_context_prepare_destroy_bounded(struct virgl_context *base, int timeout_ms)
+{
+   struct proxy_context *ctx = (struct proxy_context *)base;
+   SCOPE_TRY_LOCK_CHANNEL(ctx);
+   if (!_channel_lock || timeout_ms <= 0)
+      return false;
+   atomic_store(&ctx->quiesce_fences_held, true);
+   if (!ctx->sync_thread.created || ctx->sync_thread.joined)
+      return true;
+   if (ctx->sync_thread.join_attempted || ctx->sync_thread.fence_eventfd < 0 ||
+       thrd_equal(ctx->sync_thread.thread, thrd_current()))
+      return false;
+
+   atomic_store(&ctx->sync_thread.stop, true);
+   write_eventfd(ctx->sync_thread.fence_eventfd, 1);
+   /* A callback already admitted may reenter a context operation. It must be
+    * able to acquire the channel and observe quarantine while we join it.
+    * The caller retains context lifetime throughout preparation.
+    */
+   mtx_unlock(_channel_lock);
+   _channel_lock = NULL;
+   /* The deadline owner supplies the remaining total budget. The serialized
+    * owner retains ctx across the wait and witness update.
+    */
+   const int join_result = proxy_context_join_observer_bounded(ctx, timeout_ms);
+   ctx->sync_thread.joined = join_result == 0;
+   /* Timeout is not a failed join: a later checked cleanup may reap the same
+    * thread. Other errors are terminal for this context's join attempt.
+    */
+   ctx->sync_thread.join_attempted = join_result != ETIMEDOUT;
+   if (mtx_trylock(&ctx->channel_mutex) != thrd_success)
+      return false;
+   _channel_lock = &ctx->channel_mutex;
+   if (join_result)
+      proxy_log("prepare destroy: observer join refused for ctx %u: %d",
+                ctx->base.ctx_id, join_result);
+   return ctx->sync_thread.joined;
+}
+
+static bool
+proxy_context_prepare_destroy(struct virgl_context *base)
+{
+   /* Legacy checked teardown has a local one-second budget per observer. */
+   return proxy_context_prepare_destroy_bounded(base, 1000);
+}
+
+/* Read-only witness under the serialized context-table owner. Backend
+ * identity is checked before casting a possibly non-proxy context.
+ */
+int
+proxy_context_reset_reap_ready(struct virgl_context *base, uint64_t generation)
+{
+   if (!base || !generation)
+      return -EINVAL;
+   if (base->release_resource_for_reset != proxy_context_release_resource_for_reset)
+      return -EOPNOTSUPP;
+   struct proxy_context *ctx = (struct proxy_context *)base;
+   SCOPE_TRY_LOCK_CHANNEL(ctx);
+   if (!_channel_lock)
+      return -EBUSY;
+   if (!atomic_load(&ctx->quiesce_fences_held) || !ctx->producers_quiesced ||
+       (ctx->sync_thread.created && !ctx->sync_thread.joined))
+      return -EBUSY;
+   if (ctx->quiesce_generation != generation)
+      return -ESTALE;
+   if (!ctx->resource_table)
+      return -EIO;
+   if (_mesa_hash_table_num_entries(ctx->resource_table))
+      return -EBUSY;
+   return 0;
+}
+
 static void
 proxy_context_destroy(struct virgl_context *base)
 {
    struct proxy_context *ctx = (struct proxy_context *)base;
 
-   /* ask the server process to terminate the context process */
-   if (!proxy_client_destroy_context(ctx->client, ctx->base.ctx_id))
+   if (ctx->client && ctx->client->reset_checked_attempted) {
+      if (!ctx->client->reset_checked_reply_valid ||
+          ctx->client->reset_checked_result ||
+          !ctx->client->reset_checked_expected_records ||
+          proxy_context_reset_reap_ready(base,
+             ctx->client->reset_checked_generation)) {
+         proxy_log("destroy refused: checked remote/local witness absent for ctx %u",
+                   base->ctx_id);
+         abort();
+      }
+   }
+
+   /* Legacy void callers cannot preserve the context-table entry on failure.
+    * Prepare before either remote destruction or local release; returning
+    * would let the table discard an observer-owned context.  Checked callers
+    * prepare first and retain ownership on refusal.  Fatal here is not reset
+    * recovery, and a successful local join is not a remote GPU-idle witness.
+    */
+   if (!proxy_context_prepare_destroy(base)) {
+      proxy_log("destroy refused: observer preparation failed for ctx %u",
+                base->ctx_id);
+      abort();
+   }
+
+   /* Checked success already reaped this client's workers. Do not enqueue
+    * a legacy request on the frozen channel or mislabel it as failure.
+    */
+   if (!ctx->client->reset_checked_attempted &&
+       !proxy_client_destroy_context(ctx->client, ctx->base.ctx_id))
       proxy_log("failed to destroy ctx %d", ctx->base.ctx_id);
 
    if (ctx->sync_thread.fence_eventfd >= 0) {
-      if (ctx->sync_thread.created) {
-         ctx->sync_thread.stop = true;
-         write_eventfd(ctx->sync_thread.fence_eventfd, 1);
-         thrd_join(ctx->sync_thread.thread, NULL);
-      }
-
       close(ctx->sync_thread.fence_eventfd);
    }
 
@@ -547,6 +878,7 @@ proxy_context_destroy(struct virgl_context *base)
    proxy_context_resource_table_fini(ctx);
 
    proxy_socket_fini(&ctx->socket);
+   mtx_destroy(&ctx->channel_mutex);
 
    free(ctx);
 }
@@ -554,6 +886,10 @@ proxy_context_destroy(struct virgl_context *base)
 static void
 proxy_context_init_base(struct proxy_context *ctx)
 {
+   ctx->base.prepare_destroy = proxy_context_prepare_destroy;
+   ctx->base.prepare_destroy_bounded = proxy_context_prepare_destroy_bounded;
+   ctx->base.quiesce_producers = proxy_context_quiesce_producers;
+   ctx->base.release_resource_for_reset = proxy_context_release_resource_for_reset;
    ctx->base.destroy = proxy_context_destroy;
    ctx->base.attach_resource = proxy_context_attach_resource;
    ctx->base.detach_resource = proxy_context_detach_resource;
@@ -701,6 +1037,13 @@ proxy_context_create(uint32_t ctx_id,
       return NULL;
    }
 
+   if (mtx_init(&ctx->channel_mutex, mtx_plain) != thrd_success) {
+      close(ctx_fd);
+      free(ctx);
+      return NULL;
+   }
+   atomic_init(&ctx->quiesce_fences_held, false);
+   atomic_init(&ctx->sync_thread.stop, false);
    proxy_context_init_base(ctx);
    ctx->client = client;
    proxy_socket_init(&ctx->socket, ctx_fd);

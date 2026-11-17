@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
 #include "c11/threads.h"
 #endif
@@ -555,6 +556,123 @@ render_worker_create(struct render_worker_jail *jail,
    render_worker_jail_add_worker(jail, worker);
 
    return worker;
+}
+
+/* Checked process backend only. A timeout retains the record and its child
+ * identity; destroyed must stay false so asynchronous SIGCHLD reaping cannot
+ * remove a worker still referenced by its client record.
+ */
+int
+render_worker_destroy_checked(struct render_worker_jail *jail,
+                               struct render_worker *worker, int timeout_ms)
+{
+   if (!jail || !worker || timeout_ms <= 0)
+      return -EINVAL;
+#ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
+   /* No bounded join contract exists for this backend. */
+   return -EOPNOTSUPP;
+#else
+   struct timespec start, now;
+   const int64_t budget_ns = (int64_t)timeout_ms * 1000000;
+   if (worker->pid <= 0)
+      return -EINVAL;
+   if (clock_gettime(CLOCK_MONOTONIC, &start))
+      return -errno;
+   if (!worker->reaped && kill(worker->pid, SIGKILL) && errno != ESRCH)
+      return -errno;
+
+   for (;;) {
+      if (!worker->reaped) {
+         siginfo_t info = { 0 };
+         int ret = waitid(P_PID, worker->pid, &info, WEXITED | WNOHANG);
+         if (ret && errno != EINTR)
+            return -errno;
+         if (!ret && info.si_pid == worker->pid) {
+            if (info.si_code != CLD_EXITED && info.si_code != CLD_KILLED &&
+                info.si_code != CLD_DUMPED)
+               return -EPROTO;
+            worker->reaped = true;
+         }
+      }
+      if (clock_gettime(CLOCK_MONOTONIC, &now))
+         return -errno;
+      int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                        now.tv_nsec - start.tv_nsec;
+      if (elapsed < 0)
+         return -EIO;
+      if (elapsed >= budget_ns)
+         return -ETIMEDOUT;
+      if (worker->reaped)
+         break;
+      int64_t remaining = budget_ns - elapsed;
+      struct timespec pause = {
+         .tv_sec = 0,
+         .tv_nsec = remaining < 1000000 ? remaining : 1000000,
+      };
+      if (nanosleep(&pause, NULL) && errno != EINTR)
+         return -errno;
+   }
+   worker->destroyed = true;
+   render_worker_jail_remove_worker(jail, worker);
+   return 0;
+#endif
+}
+
+int
+render_worker_jail_drain_destroyed_checked(struct render_worker_jail *jail,
+                                           int timeout_ms, uint32_t *reaped,
+                                           uint32_t *remaining)
+{
+   if (!jail || timeout_ms <= 0 || !reaped || !remaining)
+      return -EINVAL;
+   *reaped = 0;
+   *remaining = 0;
+#ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
+   return -EOPNOTSUPP;
+#else
+   struct timespec start, now;
+   if (jail->worker_count < 0)
+      return -EIO;
+   *remaining = jail->worker_count;
+   if (clock_gettime(CLOCK_MONOTONIC, &start))
+      return -errno;
+   uint32_t count = 0;
+   /* Preflight the complete list before signaling anything. Live records
+    * must first go through their generation-bound client reset operation. */
+   list_for_each_entry (struct render_worker, worker, &jail->workers, head) {
+      if (!worker->destroyed)
+         return -EBUSY;
+      if (worker->pid <= 0 || count == UINT32_MAX)
+         return -EIO;
+      count++;
+   }
+   if (count != *remaining)
+      return -EIO;
+   const int64_t budget = (int64_t)timeout_ms * 1000000;
+   list_for_each_entry_safe (struct render_worker, worker, &jail->workers, head) {
+      if (clock_gettime(CLOCK_MONOTONIC, &now))
+         return -errno;
+      int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                        now.tv_nsec - start.tv_nsec;
+      int64_t left_ms = (budget - elapsed) / 1000000;
+      if (elapsed < 0 || left_ms <= 0)
+         return elapsed < 0 ? -EIO : -ETIMEDOUT;
+      int ret = render_worker_destroy_checked(jail, worker, left_ms);
+      if (ret)
+         return ret;
+      (*reaped)++;
+      (*remaining)--;
+   }
+   if (clock_gettime(CLOCK_MONOTONIC, &now))
+      return -errno;
+   int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                     now.tv_nsec - start.tv_nsec;
+   if (elapsed < 0 || elapsed >= budget)
+      return elapsed < 0 ? -EIO : -ETIMEDOUT;
+   if (jail->worker_count || !list_is_empty(&jail->workers) || *remaining)
+      return -EIO;
+   return 0;
+#endif
 }
 
 void

@@ -6,6 +6,7 @@
 #include "vkr_device_memory.h"
 
 #include <math.h>
+#include <sys/stat.h>
 
 #include "vn_protocol_renderer_transport.h"
 
@@ -543,6 +544,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    }
 
    mem->device = dev;
+   mem->context_id = ctx->ctx_id;
    mem->might_export = might_export;
    mem->property_flags = property_flags;
    mem->valid_fd_types = valid_fd_types;
@@ -552,6 +554,17 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->allocation_size = alloc_info->allocationSize;
    mem->memory_type_index = mem_type_index;
    mem->budget_charge = budget_charge;
+   if (vkr_scanout_trace_permit())
+      vkr_log("scanout_memory_allocate context_id=%u device_id=%" PRIu64
+              " memory_id=%" PRIu64
+              " allocation_size=%" PRIu64 " memory_type=%u"
+              " property_flags=0x%x export_handle_types=0x%x"
+              " valid_fd_types=0x%x",
+              mem->context_id, dev->base.id, mem->base.id,
+              mem->allocation_size,
+              mem->memory_type_index,
+              mem->property_flags, export_info ? export_info->handleTypes : 0,
+              mem->valid_fd_types);
 }
 
 static void
@@ -712,6 +725,28 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
          .u.fd = os_dupfd_cloexec(mem->mtl_shm->shm_fd),
          .map_info = map_info,
       };
+      if (vkr_scanout_trace_permit()) {
+         struct stat fd_stat;
+         if (out_blob->u.fd >= 0 && fstat(out_blob->u.fd, &fd_stat) == 0)
+            vkr_log("scanout_memory_export context_id=%u device_id=%" PRIu64
+                    " memory_id=%" PRIu64
+                    " fd_type=%u fd=%d dev=%" PRIuMAX " ino=%" PRIuMAX
+                    " fd_size=%" PRIdMAX " blob_size=%" PRIu64
+                    " allocation_size=%" PRIu64 " memory_type=%u"
+                    " property_flags=0x%x",
+                    mem->context_id, mem->device->base.id, mem->base.id,
+                    VIRGL_RESOURCE_FD_SHM, out_blob->u.fd,
+                    (uintmax_t)fd_stat.st_dev, (uintmax_t)fd_stat.st_ino,
+                    (intmax_t)fd_stat.st_size, blob_size, mem->allocation_size,
+                    mem->memory_type_index, mem->property_flags);
+         else
+            vkr_log("scanout_memory_export_stat_failed context_id=%u"
+                    " device_id=%" PRIu64
+                    " memory_id=%" PRIu64
+                    " fd_type=%u fd=%d errno=%d",
+                    mem->context_id, mem->device->base.id, mem->base.id,
+                    VIRGL_RESOURCE_FD_SHM, out_blob->u.fd, errno);
+      }
       return out_blob->u.fd >= 0;
    }
 
@@ -788,6 +823,31 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                  blob_size);
          close(fd);
          return false;
+      }
+   }
+
+   if (vkr_scanout_trace_permit()) {
+      struct stat fd_stat;
+      if (fstat(fd, &fd_stat) == 0) {
+         vkr_log("scanout_memory_export context_id=%u device_id=%" PRIu64
+                 " memory_id=%" PRIu64
+                 " fd_type=%u fd=%d dev=%" PRIuMAX " ino=%" PRIuMAX
+                 " fd_size=%" PRIdMAX " blob_size=%" PRIu64
+                 " allocation_size=%" PRIu64 " memory_type=%u"
+                 " property_flags=0x%x",
+                 mem->context_id, mem->device->base.id, mem->base.id,
+                 fd_type, fd,
+                 (uintmax_t)fd_stat.st_dev,
+                 (uintmax_t)fd_stat.st_ino, (intmax_t)fd_stat.st_size,
+                 blob_size, mem->allocation_size, mem->memory_type_index,
+                 mem->property_flags);
+      } else {
+         vkr_log("scanout_memory_export_stat_failed context_id=%u"
+                 " device_id=%" PRIu64
+                 " memory_id=%" PRIu64
+                 " fd_type=%u fd=%d errno=%d",
+                 mem->context_id, mem->device->base.id, mem->base.id,
+                 fd_type, fd, errno);
       }
    }
 

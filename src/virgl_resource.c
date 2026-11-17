@@ -76,6 +76,29 @@ virgl_resource_table_cleanup(void)
    memset(&pipe_callbacks, 0, sizeof(pipe_callbacks));
 }
 
+static enum pipe_error
+virgl_resource_mark_present(void *key, void *val, void *data)
+{
+   (void)key;
+   (void)val;
+   *(bool *)data = true;
+   return PIPE_ERROR;
+}
+
+int
+virgl_resource_table_validate_empty(void)
+{
+   if (!virgl_resource_table)
+      return -EINVAL;
+   bool present = false;
+   enum pipe_error ret = util_hash_table_foreach(virgl_resource_table,
+                                                 virgl_resource_mark_present,
+                                                 &present);
+   if (present)
+      return -EBUSY;
+   return ret == PIPE_OK ? 0 : -EIO;
+}
+
 void
 virgl_resource_table_reset(void)
 {

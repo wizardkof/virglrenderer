@@ -42,6 +42,11 @@ render_socket_receive_request_with_fds(struct render_socket *socket,
 bool
 render_socket_receive_data(struct render_socket *socket, void *data, size_t size);
 
+/* Exclusive channel owner; Linux no-FD seqpacket, one nonblocking attempt. */
+bool
+render_socket_send_reply_nowait(struct render_socket *socket, const void *data,
+                                size_t size);
+
 bool
 render_socket_send_reply(struct render_socket *socket, const void *data, size_t size);
 

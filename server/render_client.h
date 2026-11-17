@@ -13,6 +13,10 @@ struct render_client {
    struct render_socket socket;
 
    uint32_t init_flags;
+   bool reset_checked_attempted;
+   struct render_client_op_reset_checked_reply reset_checked_reply;
+   bool jail_checked_attempted;
+   struct render_client_op_jail_checked_reply jail_checked_reply;
 
    struct list_head context_records;
 };

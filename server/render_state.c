@@ -200,6 +200,13 @@ render_state_destroy_context(uint32_t ctx_id)
    render_state_remove_context(ctx);
 }
 
+struct vkr_reset_wait_result
+render_state_wait_idle_for_reset(uint32_t ctx_id, uint64_t generation)
+{
+   SCOPE_LOCK_RENDERER();
+   return vkr_renderer_wait_idle_for_reset(ctx_id, generation);
+}
+
 bool
 render_state_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size)
 {

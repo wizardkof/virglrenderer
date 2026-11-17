@@ -24,6 +24,35 @@ render_context_update_timeline(struct render_context *ctx,
 }
 
 static bool
+render_context_dispatch_quiesce(struct render_context *ctx,
+                                const union render_context_op_request *request,
+                                UNUSED const int *fds,
+                                UNUSED int fd_count)
+{
+   const struct vkr_reset_wait_result result =
+      request->quiesce.protocol_version == RENDER_QUIESCE_PROTOCOL_VERSION ?
+         render_state_wait_idle_for_reset(ctx->ctx_id, request->quiesce.generation) :
+         (struct vkr_reset_wait_result) {
+            .status = VKR_RESET_WAIT_PROTOCOL_MISMATCH,
+            .context_id = ctx->ctx_id,
+            .generation = request->quiesce.generation,
+         };
+   const struct render_context_op_quiesce_reply reply = {
+      .generation = result.generation,
+      .ctx_id = result.context_id,
+      .phase = RENDER_QUIESCE_ATTEMPT_FINISHED,
+      .status = result.status,
+      .devices_waited = result.devices_waited,
+      .vk_result = result.vk_result,
+      .protocol_version = RENDER_QUIESCE_PROTOCOL_VERSION,
+   };
+   /* Even an error is returned as data. A send success is not GPU readiness.
+    * The operation can block; callers require external timeout supervision.
+    */
+   return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
+}
+
+static bool
 render_context_dispatch_submit_fence(struct render_context *ctx,
                                      const union render_context_op_request *request,
                                      UNUSED const int *fds,
@@ -192,6 +221,7 @@ static const struct render_context_dispatch_entry
       RENDER_CONTEXT_DISPATCH(DESTROY_RESOURCE, destroy_resource, 0),
       RENDER_CONTEXT_DISPATCH(SUBMIT_CMD, submit_cmd, 0),
       RENDER_CONTEXT_DISPATCH(SUBMIT_FENCE, submit_fence, 0),
+      RENDER_CONTEXT_DISPATCH(QUIESCE, quiesce, 0),
 #undef RENDER_CONTEXT_DISPATCH
    };
 

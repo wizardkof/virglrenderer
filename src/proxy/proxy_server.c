@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "server/render_protocol.h"
 
@@ -25,10 +26,63 @@ proxy_server_connect(struct proxy_server *srv)
    return client_fd;
 }
 
+int
+proxy_server_reap_checked(struct proxy_server *srv, int timeout_ms)
+{
+   if (!srv || timeout_ms <= 0)
+      return -EINVAL;
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   /* No bounded thread-join witness exists here. */
+   return -EOPNOTSUPP;
+#else
+   struct timespec start, now;
+   const int64_t budget = (int64_t)timeout_ms * 1000000;
+   if (srv->pid <= 0)
+      return -EOPNOTSUPP;
+   if (clock_gettime(CLOCK_MONOTONIC, &start))
+      return -errno;
+   if (!srv->reaped && kill(srv->pid, SIGKILL) && errno != ESRCH)
+      return -errno;
+   for (;;) {
+      if (!srv->reaped) {
+         siginfo_t info = { 0 };
+         int ret = waitid(P_PID, srv->pid, &info, WEXITED | WNOHANG);
+         if (ret && errno != EINTR)
+            return -errno;
+         if (!ret && info.si_pid == srv->pid) {
+            if (info.si_code != CLD_EXITED && info.si_code != CLD_KILLED &&
+                info.si_code != CLD_DUMPED)
+               return -EPROTO;
+            /* Persist even if the budget expires immediately afterwards:
+             * a retry must never signal a PID which may have been reused. */
+            srv->reaped = true;
+         }
+      }
+      if (clock_gettime(CLOCK_MONOTONIC, &now))
+         return -errno;
+      int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                        now.tv_nsec - start.tv_nsec;
+      if (elapsed < 0)
+         return -EIO;
+      if (elapsed >= budget)
+         return -ETIMEDOUT;
+      if (srv->reaped)
+         return 0;
+      int64_t remaining = budget - elapsed;
+      struct timespec pause = {
+         .tv_sec = 0,
+         .tv_nsec = remaining < 1000000 ? remaining : 1000000,
+      };
+      if (nanosleep(&pause, NULL) && errno != EINTR)
+         return -errno;
+   }
+#endif
+}
+
 void
 proxy_server_destroy(struct proxy_server *srv)
 {
-   if (srv->pid >= 0) {
+   if (srv->pid > 0 && !srv->reaped) {
       kill(srv->pid, SIGKILL);
 
       siginfo_t siginfo = { 0 };

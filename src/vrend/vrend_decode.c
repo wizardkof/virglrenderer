@@ -2156,6 +2156,10 @@ static void vrend_decode_ctx_init_base(struct vrend_decode_ctx *dctx,
       assert(decode_table[i]);
 
    ctx->ctx_id = ctx_id;
+   ctx->prepare_destroy = NULL;
+   ctx->prepare_destroy_bounded = NULL;
+   ctx->quiesce_producers = NULL;
+   ctx->release_resource_for_reset = NULL;
    ctx->destroy = vrend_decode_ctx_destroy;
    ctx->attach_resource = vrend_decode_ctx_attach_resource;
    ctx->detach_resource = vrend_decode_ctx_detach_resource;

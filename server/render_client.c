@@ -6,6 +6,9 @@
 #include "render_client.h"
 
 #include <unistd.h>
+#include <errno.h>
+#include <limits.h>
+#include <time.h>
 
 #include "render_context.h"
 #include "render_server.h"
@@ -174,6 +177,11 @@ static bool
 render_client_dispatch_destroy_context(struct render_client *client,
                                        const union render_client_op_request *req)
 {
+   /* A checked attempt freezes this channel's topology. Do not let legacy
+    * asynchronous mutations bypass its record/reap evidence.
+    */
+   if (client->reset_checked_attempted)
+      return false;
    const uint32_t ctx_id = req->destroy_context.ctx_id;
    struct render_context_record *rec = render_client_find_record(client, ctx_id);
    if (rec)
@@ -186,6 +194,10 @@ static bool
 render_client_dispatch_create_context(struct render_client *client,
                                       const union render_client_op_request *req)
 {
+   if (client->reset_checked_attempted) {
+      const struct render_client_op_create_context_reply reply = { .ok = false };
+      return render_socket_send_reply_nowait(&client->socket, &reply, sizeof(reply));
+   }
    struct render_server *srv = client->server;
 
    int remote_fd;
@@ -212,9 +224,165 @@ render_client_dispatch_create_context(struct render_client *client,
 }
 
 static bool
+render_client_dispatch_reset_checked(struct render_client *client,
+                                      const union render_client_op_request *req)
+{
+   const struct render_client_op_reset_checked_request *request = &req->reset_checked;
+   struct render_client_op_reset_checked_reply reply = {
+      .generation = request->generation,
+      .protocol_version = RENDER_RESET_CHECKED_VERSION,
+   };
+   struct timespec start, now;
+   bool cache = false;
+   if (request->protocol_version != RENDER_RESET_CHECKED_VERSION) {
+      reply.status = -EPROTO;
+      goto send;
+   }
+   if (!request->generation || !request->timeout_ms || request->timeout_ms > INT_MAX) {
+      reply.status = -EINVAL;
+      goto send;
+   }
+   if (client->reset_checked_attempted) {
+      if (request->generation == client->reset_checked_reply.generation)
+         return render_socket_send_reply_nowait(&client->socket, &client->reset_checked_reply,
+                                           sizeof(client->reset_checked_reply));
+      if (request->generation < client->reset_checked_reply.generation) {
+         reply.status = -ESTALE;
+         goto send;
+      }
+   }
+   cache = true;
+   client->reset_checked_attempted = true;
+   client->reset_checked_reply = reply;
+   client->reset_checked_reply.status = -EINPROGRESS;
+   if (clock_gettime(CLOCK_MONOTONIC, &start)) {
+      reply.status = -errno;
+      goto count;
+   }
+   const int64_t budget_ns = (int64_t)request->timeout_ms * 1000000;
+   list_for_each_entry_safe (struct render_context_record, rec,
+                             &client->context_records, head) {
+      if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+         reply.status = -errno;
+         reply.failed_ctx_id = rec->ctx_id;
+         break;
+      }
+      int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                        now.tv_nsec - start.tv_nsec;
+      int64_t remaining = (budget_ns - elapsed) / 1000000;
+      if (elapsed < 0 || remaining <= 0) {
+         reply.status = elapsed < 0 ? -EIO : -ETIMEDOUT;
+         reply.failed_ctx_id = rec->ctx_id;
+         break;
+      }
+      int ret = render_worker_destroy_checked(client->server->worker_jail,
+                                              rec->worker, remaining);
+      if (ret) {
+         reply.status = ret;
+         reply.failed_ctx_id = rec->ctx_id;
+         break;
+      }
+      list_del(&rec->head);
+      free(rec);
+      reply.reaped_count++;
+   }
+   if (!reply.status) {
+      if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+         reply.status = -errno;
+      } else {
+         int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                           now.tv_nsec - start.tv_nsec;
+         if (elapsed < 0 || elapsed >= budget_ns)
+            reply.status = elapsed < 0 ? -EIO : -ETIMEDOUT;
+      }
+   }
+count:
+   list_for_each_entry (struct render_context_record, rec, &client->context_records,
+                        head) {
+      reply.remaining_count++;
+   }
+   if (!reply.status && !reply.remaining_count)
+      reply.phase = RENDER_RESET_RECORDS_REAPED;
+   if (cache)
+      client->reset_checked_reply = reply;
+send:
+   return render_socket_send_reply_nowait(&client->socket, &reply, sizeof(reply));
+}
+
+static bool
+render_client_dispatch_jail_checked(struct render_client *client,
+                                    const union render_client_op_request *req)
+{
+   const struct render_client_op_jail_checked_request *request = &req->jail_checked;
+   struct render_client_op_jail_checked_reply reply = {
+      .generation = request->generation,
+      .protocol_version = RENDER_JAIL_CHECKED_VERSION,
+   };
+   struct timespec start, now;
+   if (request->protocol_version != RENDER_JAIL_CHECKED_VERSION) {
+      reply.status = -EPROTO;
+      goto send;
+   }
+   if (!request->generation || !request->timeout_ms || request->timeout_ms > INT_MAX) {
+      reply.status = -EINVAL;
+      goto send;
+   }
+   if (client->jail_checked_attempted) {
+      if (client->jail_checked_reply.generation == request->generation)
+         return render_socket_send_reply_nowait(&client->socket,
+                  &client->jail_checked_reply, sizeof(client->jail_checked_reply));
+      reply.status = -EBUSY;
+      goto send;
+   }
+   if (!client->reset_checked_attempted || client->reset_checked_reply.status ||
+       client->reset_checked_reply.phase != RENDER_RESET_RECORDS_REAPED ||
+       !list_is_empty(&client->context_records)) {
+      reply.status = -EBUSY;
+      goto send;
+   }
+   if (client->reset_checked_reply.generation != request->generation) {
+      reply.status = -ESTALE;
+      goto send;
+   }
+   client->jail_checked_attempted = true;
+   client->jail_checked_reply = reply;
+   client->jail_checked_reply.status = -EINPROGRESS;
+   if (clock_gettime(CLOCK_MONOTONIC, &start)) {
+      reply.status = -errno;
+      goto finish;
+   }
+   reply.status = render_worker_jail_drain_destroyed_checked(
+      client->server->worker_jail, request->timeout_ms,
+      &reply.reaped_count, &reply.remaining_count);
+   if (!reply.status) {
+      if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+         reply.status = -errno;
+      } else {
+         int64_t elapsed = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000 +
+                           now.tv_nsec - start.tv_nsec;
+         if (elapsed < 0 || elapsed >= (int64_t)request->timeout_ms * 1000000)
+            reply.status = elapsed < 0 ? -EIO : -ETIMEDOUT;
+      }
+      if (!reply.status && reply.remaining_count)
+         reply.status = -EPROTO;
+      if (!reply.status)
+         reply.phase = RENDER_JAIL_EMPTY;
+   }
+finish:
+   client->jail_checked_reply = reply;
+send:
+   return render_socket_send_reply_nowait(&client->socket, &reply, sizeof(reply));
+}
+
+static bool
 render_client_dispatch_reset(struct render_client *client,
                              UNUSED const union render_client_op_request *req)
 {
+   /* A checked attempt freezes this channel's topology. Do not let legacy
+    * asynchronous mutations bypass its record/reap evidence.
+    */
+   if (client->reset_checked_attempted)
+      return false;
    render_client_clear_records(client);
    return true;
 }
@@ -223,6 +391,11 @@ static bool
 render_client_dispatch_init(struct render_client *client,
                             const union render_client_op_request *req)
 {
+   /* A checked attempt freezes this channel's topology. Do not let legacy
+    * asynchronous mutations bypass its record/reap evidence.
+    */
+   if (client->reset_checked_attempted)
+      return false;
    client->init_flags = req->init.flags;
    vkr_library_preload_icd();
    return true;
@@ -250,6 +423,8 @@ static const struct render_client_dispatch_entry
       RENDER_CLIENT_DISPATCH(NOP, nop),
       RENDER_CLIENT_DISPATCH(INIT, init),
       RENDER_CLIENT_DISPATCH(RESET, reset),
+      RENDER_CLIENT_DISPATCH(RESET_CHECKED, reset_checked),
+      RENDER_CLIENT_DISPATCH(JAIL_CHECKED, jail_checked),
       RENDER_CLIENT_DISPATCH(CREATE_CONTEXT, create_context),
       RENDER_CLIENT_DISPATCH(DESTROY_CONTEXT, destroy_context),
 #undef RENDER_CLIENT_DISPATCH

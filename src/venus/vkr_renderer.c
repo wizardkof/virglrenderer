@@ -147,6 +147,20 @@ vkr_renderer_destroy_context(uint32_t ctx_id)
    vkr_context_destroy(ctx);
 }
 
+struct vkr_reset_wait_result
+vkr_renderer_wait_idle_for_reset(uint32_t ctx_id, uint64_t generation)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx) {
+      return (struct vkr_reset_wait_result) {
+         .status = VKR_RESET_WAIT_CONTEXT_MISSING,
+         .context_id = ctx_id,
+         .generation = generation,
+      };
+   }
+   return vkr_context_wait_idle_for_reset(ctx, generation);
+}
+
 bool
 vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size)
 {

@@ -41,6 +41,21 @@ render_worker_create(struct render_worker_jail *jail,
                      void *thread_data,
                      size_t thread_data_size);
 
+/* Serialized server-loop owner; no parallel reaper may modify this worker.
+ * Success means this exact process worker was reaped before removal.
+ * Failure retains its record; thread workers refuse without unbounded join.
+ */
+int
+render_worker_destroy_checked(struct render_worker_jail *jail,
+                               struct render_worker *worker, int timeout_ms);
+
+/* Exclusive server-loop owner, after current client records are removed.
+ * Only detached workers already marked destroyed are eligible. */
+int
+render_worker_jail_drain_destroyed_checked(struct render_worker_jail *jail,
+                                           int timeout_ms, uint32_t *reaped,
+                                           uint32_t *remaining);
+
 void
 render_worker_destroy(struct render_worker_jail *jail, struct render_worker *worker);
 

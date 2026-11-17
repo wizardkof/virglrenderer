@@ -80,6 +80,23 @@ struct virgl_context {
 
    bool supports_fence_sharing;
 
+   /* Optional fallible preparation. Must retain all owned state on failure.
+    * Success must be idempotent; caller serializes context lifetime.
+    */
+   bool (*prepare_destroy)(struct virgl_context *ctx);
+   /* Optional bounded counterpart. A context requiring preparation must not
+    * fall back to the unbounded callback during a deadline-owned operation.
+    */
+   bool (*prepare_destroy_bounded)(struct virgl_context *ctx, int remaining_ms);
+   /* Producer-only quiescence, not scanout/renderer readiness. Unknown must fail. */
+   int (*quiesce_producers)(struct virgl_context *ctx, uint64_t generation,
+                             int remaining_ms);
+   /* Local metadata withdrawal only, after exact producer generation idle.
+    * validate_only must not mutate. Remote lifetime remains a reset concern.
+    */
+   int (*release_resource_for_reset)(struct virgl_context *ctx,
+                                    struct virgl_resource *res,
+                                    uint64_t generation, bool validate_only);
    void (*destroy)(struct virgl_context *ctx);
 
    void (*attach_resource)(struct virgl_context *ctx,
@@ -156,6 +173,22 @@ virgl_context_table_reset(void);
 
 int
 virgl_context_add(struct virgl_context *ctx);
+
+/* Two-phase ownership gates. Failure does not remove/clear any table entry.
+ * Global teardown must prepare all before its first destructive action.
+ */
+int
+virgl_context_quiesce_all(uint64_t generation, int timeout_ms);
+
+int
+virgl_context_release_resource_for_reset(struct virgl_resource *res,
+                                         uint64_t generation);
+
+bool
+virgl_context_prepare_destroy_all(void);
+
+bool
+virgl_context_remove_checked(uint32_t ctx_id);
 
 void
 virgl_context_remove(uint32_t ctx_id);
